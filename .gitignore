@@ -1,0 +1,22 @@
+Debug/
+Release/
+*.elf
+*.list
+*.map
+*.hex
+*.bin
+*.o
+*.d
+*.su
+
+.settings/
+
+.DS_Store
+Thumbs.db
+
+# Local editor/clangd files
+.cache/
+.clangd
+.vscode/
+.metadata/
+compile_commands.json
