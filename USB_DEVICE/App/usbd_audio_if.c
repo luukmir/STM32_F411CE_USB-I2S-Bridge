@@ -124,7 +124,8 @@ static int8_t AUDIO_PeriodicTC_FS(uint8_t *pbuf, uint32_t size, uint8_t cmd);
 static int8_t AUDIO_GetState_FS(void);
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
-
+extern void rxBufferReset();
+extern void rxBufferWrite(int16_t* data, uint32_t length);
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
 /**
@@ -168,6 +169,8 @@ static int8_t AUDIO_Init_FS(uint32_t AudioFreq, uint32_t Volume, uint32_t option
 static int8_t AUDIO_DeInit_FS(uint32_t options)
 {
   /* USER CODE BEGIN 1 */
+	rxBufferReset();
+
   UNUSED(options);
   return (USBD_OK);
   /* USER CODE END 1 */
@@ -183,17 +186,17 @@ static int8_t AUDIO_DeInit_FS(uint32_t options)
 static int8_t AUDIO_AudioCmd_FS(uint8_t* pbuf, uint32_t size, uint8_t cmd)
 {
   /* USER CODE BEGIN 2 */
+
   switch(cmd)
   {
     case AUDIO_CMD_START:
-    	HAL_I2S_Transmit_DMA(&hi2s1, (uint16_t*)pbuf, size / 2);
     break;
 
     case AUDIO_CMD_PLAY:
     break;
 
     case AUDIO_CMD_STOP:
-    	HAL_I2S_DMAStop(&hi2s1);
+      rxBufferReset();
 		break;
   }
 
@@ -235,9 +238,8 @@ static int8_t AUDIO_MuteCtl_FS(uint8_t cmd)
 static int8_t AUDIO_PeriodicTC_FS(uint8_t *pbuf, uint32_t size, uint8_t cmd)
 {
   /* USER CODE BEGIN 5 */
-  UNUSED(pbuf);
-  UNUSED(size);
-  UNUSED(cmd);
+	rxBufferWrite((int16_t*)pbuf, size / 2);
+
   return (USBD_OK);
   /* USER CODE END 5 */
 }

@@ -23,6 +23,12 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
+#include "usbd_audio_if.h"
+#include "audio_ring_buffer.hpp"
+
+#include <array>
+#include <cstdint>
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,7 +53,11 @@ DMA_HandleTypeDef hdma_spi1_tx;
 TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
+__attribute__((aligned(32))) std::array<int16_t, 192> txBuffer;
+AudioRingBuffer<int16_t, 2048> rxBuffer;
 
+std::array<int16_t,96> d_value;
+uint32_t d_available{0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -99,15 +109,18 @@ int main(void)
   MX_I2S1_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-
+  auto *pTx{reinterpret_cast<uint16_t *>(txBuffer.data())};
+	if (HAL_I2S_Transmit_DMA(&hi2s1, pTx, static_cast<uint16_t>(txBuffer.size())) != HAL_OK) {
+		Error_Handler();
+	}
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-  	HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-		HAL_Delay(500);
+		rxBuffer.read(d_value.data(), 96);
+		d_available = rxBuffer.getAvailableSamples();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -132,11 +145,12 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 25;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 16;
   RCC_OscInitStruct.PLL.PLLN = 192;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 4;
@@ -271,7 +285,6 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
@@ -289,7 +302,36 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+extern "C" {
+	void rxBufferReset() {
+		rxBuffer.reset();
+	}
+	void rxBufferWrite(int16_t *data, uint32_t length) {
+	  rxBuffer.write(data, length);
+	}
+  void processAudio(uint32_t start, uint32_t numSamples) {
+    static std::array<int16_t, 96> tempBuf;
 
+    if (numSamples > tempBuf.size()) {
+      numSamples = tempBuf.size();
+    }
+
+    rxBuffer.read(tempBuf.data(), numSamples);
+    for (uint32_t j = 0; j < numSamples; ++j) {
+      txBuffer[start + j] = tempBuf[j];
+    }
+	}
+	void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s) {
+		if (hi2s == &hi2s1) {
+      processAudio(0, 96U);
+		}
+	}
+	void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s) {
+		if (hi2s == &hi2s1) {
+      processAudio(96U, 96U);
+		}
+	}
+}
 /* USER CODE END 4 */
 
 /**

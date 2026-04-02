@@ -218,8 +218,8 @@ __ALIGN_BEGIN static uint8_t
         0x01, /* wTerminalType AUDIO_TERMINAL_USB_STREAMING   0x0101 */
         0x01,
         0x00, /* bAssocTerminal */
-        0x01, /* bNrChannels */
-        0x00, /* wChannelConfig 0x0000  Mono */
+        0x02, /* bNrChannels */
+        0x03, /* wChannelConfig 0x0003  Stereo (L|R) */
         0x00,
         0x00, /* iChannelNames */
         0x00, /* iTerminal */
@@ -586,7 +586,8 @@ static uint8_t USBD_AUDIO_Setup(USBD_HandleTypeDef *pdev,
         case USB_REQ_SET_INTERFACE:
           if (pdev->dev_state == USBD_STATE_CONFIGURED)
           {
-            if ((uint8_t)(req->wValue) <= USBD_MAX_NUM_INTERFACES)
+            /* Accept only AudioStreaming interface alt settings 0/1. */
+            if (((uint8_t)(req->wIndex) == 0x01U) && ((uint8_t)(req->wValue) <= 0x01U))
             {
               haudio->alt_setting = (uint8_t)(req->wValue);
             }
@@ -647,7 +648,12 @@ static uint8_t USBD_AUDIO_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum) {
   /* USER CODE BEGIN */
   /* User customization: DataIn on feedback EP clears busy flag for next SOF packet. */
   USBD_AUDIO_HandleTypeDef *haudio;
-  haudio = (USBD_AUDIO_HandleTypeDef *)pdev->pClassData;
+
+  if (pdev->pClassDataCmsit[pdev->classId] == NULL) {
+    return (uint8_t)USBD_FAIL;
+  }
+
+  haudio = (USBD_AUDIO_HandleTypeDef *)pdev->pClassDataCmsit[pdev->classId];
 
   if (epnum == (AUDIOInEpAdd & 0xFU)) {
     haudio->iso_cont.tx_flag = 0U;
@@ -728,12 +734,13 @@ static uint8_t USBD_AUDIO_SOF(USBD_HandleTypeDef *pdev) {
   R2FBB fb_data;
 
   if (haudio->iso_cont.tx_flag == 0U) {
-		USB_OTG_GlobalTypeDef *USBx = USB_OTG_FS;
-		uint32_t USBx_BASE = (uint32_t)USBx;
+    USB_OTG_GlobalTypeDef *USBx = USB_OTG_FS;
+    uint32_t USBx_BASE = (uint32_t)USBx;
 		uint32_t volatile fnsof_new = (USBx_DEVICE->DSTS & USB_OTG_DSTS_FNSOF) >> 8;
 
 		if ((haudio->iso_cont.fnsof & 0x1) == (fnsof_new & 0x1)) {
-			fb_data.rate = (((haudio->iso_cont.fs / 1000) << 14) | ((haudio->iso_cont.fs % 1000) << 4));
+      /* 10.14 format: fb = fs * 2^14 / 1000, rounded to nearest. */
+      fb_data.rate = (uint32_t)(((haudio->iso_cont.fs << 14) + 500U) / 1000U);
 			fb_data.fbbuf[3] = 0x00;
 
 			USBD_LL_Transmit(pdev, AUDIOInEpAdd, (uint8_t *)fb_data.fbbuf, 3U);
@@ -895,7 +902,7 @@ static uint8_t USBD_AUDIO_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum) {
 
   if (haudio == NULL) return (uint8_t)USBD_FAIL;
 
-  if (epnum == AUDIOOutEpAdd) {
+  if (epnum == (AUDIOOutEpAdd & 0xFU)) {
     PacketSize = (uint16_t)USBD_LL_GetRxDataSize(pdev, epnum);
 
     /* USER CODE BEGIN */
