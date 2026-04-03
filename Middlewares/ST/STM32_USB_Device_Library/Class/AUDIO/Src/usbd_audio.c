@@ -63,6 +63,8 @@ EndBSPDependencies */
 #include "usbd_audio.h"
 #include "usbd_ctlreq.h"
 
+extern int32_t rxBufferGetAvailableFrames(void);
+
 extern DMA_HandleTypeDef hdma_tim2_ch1;
 extern TIM_HandleTypeDef htim2;
 /** @addtogroup STM32_USB_DEVICE_LIBRARY
@@ -733,20 +735,35 @@ static uint8_t USBD_AUDIO_SOF(USBD_HandleTypeDef *pdev) {
   } R2FBB;
   R2FBB fb_data;
 
+#ifndef USB_OTG_FS_DEVICE
+#define USB_OTG_FS_DEVICE                                                      \
+  ((USB_OTG_DeviceTypeDef *)((uint32_t)USB_OTG_FS + USB_OTG_DEVICE_BASE))
+#endif
+
   if (haudio->iso_cont.tx_flag == 0U) {
-    USB_OTG_GlobalTypeDef *USBx = USB_OTG_FS;
-    uint32_t USBx_BASE = (uint32_t)USBx;
-		uint32_t volatile fnsof_new = (USBx_DEVICE->DSTS & USB_OTG_DSTS_FNSOF) >> 8;
+    uint32_t frame_number = (USB_OTG_FS_DEVICE->DSTS & USB_OTG_DSTS_FNSOF) >> 8;
 
-		if ((haudio->iso_cont.fnsof & 0x1) == (fnsof_new & 0x1)) {
-      /* 10.14 format: fb = fs * 2^14 / 1000, rounded to nearest. */
-      fb_data.rate = (uint32_t)(((haudio->iso_cont.fs << 14) + 500U) / 1000U);
-			fb_data.fbbuf[3] = 0x00;
+    uint8_t epnum = AUDIOInEpAdd & 0x7FU;
+    USB_OTG_INEndpointTypeDef *const ep =
+        (USB_OTG_INEndpointTypeDef *)((uint32_t)USB_OTG_FS +
+                                      USB_OTG_IN_ENDPOINT_BASE +
+                                      (epnum * USB_OTG_EP_REG_SIZE));
 
-			USBD_LL_Transmit(pdev, AUDIOInEpAdd, (uint8_t *)fb_data.fbbuf, 3U);
-			haudio->iso_cont.tx_flag = 1U;
-		}
-	}
+    if (frame_number & 0x1U) {
+      ep->DIEPCTL |= USB_OTG_DIEPCTL_SD0PID_SEVNFRM;
+    } else {
+      ep->DIEPCTL |= USB_OTG_DIEPCTL_SODDFRM;
+    }
+
+    fb_data.rate = ((haudio->iso_cont.fs / 1000U) << 14) |
+                   ((haudio->iso_cont.fs % 1000U) << 4);
+    fb_data.fbbuf[3] = 0x00;
+
+    if (USBD_LL_Transmit(pdev, AUDIOInEpAdd, (uint8_t *)fb_data.fbbuf, 3U) ==
+        USBD_OK) {
+      haudio->iso_cont.tx_flag = 1U;
+    }
+  }
   /* USER CODE END */
 
   return (uint8_t)USBD_OK;
@@ -841,10 +858,7 @@ static uint8_t USBD_AUDIO_IsoINIncomplete(USBD_HandleTypeDef *pdev,
   haudio = (USBD_AUDIO_HandleTypeDef *)pdev->pClassDataCmsit[pdev->classId];
 
   if (haudio != NULL) {
-    USB_OTG_GlobalTypeDef* USBx = USB_OTG_FS;
-    uint32_t USBx_BASE = (uint32_t)USBx;
-
-    haudio->iso_cont.fnsof = (USBx_DEVICE->DSTS & USB_OTG_DSTS_FNSOF) >> 8;
+    haudio->iso_cont.fnsof = (USB_OTG_FS_DEVICE->DSTS & USB_OTG_DSTS_FNSOF) >> 8;
 
     if (haudio->iso_cont.tx_flag == 1U) {
       haudio->iso_cont.tx_flag = 0U;
@@ -918,25 +932,19 @@ static uint8_t USBD_AUDIO_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum) {
     haudio->iso_cont.usbintn++;
 
     if ((haudio->iso_cont.usbintn % 4) == 0) {
+      int32_t available_frames = rxBufferGetAvailableFrames();
+      int32_t target_frames = 512;
+      int32_t frame_diff = available_frames - target_frames;
 
-      extern DMA_HandleTypeDef hdma_spi1_tx;
+      int32_t new_fs = (int32_t)USBD_AUDIO_FREQ - frame_diff;
 
-      uint16_t remaining_items = (uint16_t)__HAL_DMA_GET_COUNTER(&hdma_spi1_tx);
-      uint32_t dma_remaining_bytes = remaining_items * 2;
-      uint32_t ofs_dac_bytes = AUDIO_TOTAL_BUF_SIZE - dma_remaining_bytes;
-
-      int32_t ofs_diff = (int32_t)haudio->iso_cont.ofs_packet - (int32_t)ofs_dac_bytes;
-
-      if (ofs_diff < -((int32_t)AUDIO_TOTAL_BUF_SIZE / 2)) {
-        ofs_diff += AUDIO_TOTAL_BUF_SIZE;
-      } else if (ofs_diff > ((int32_t)AUDIO_TOTAL_BUF_SIZE / 2)) {
-        ofs_diff -= AUDIO_TOTAL_BUF_SIZE;
+      if (new_fs > (int32_t)(USBD_AUDIO_FREQ + 200)) {
+        new_fs = (int32_t)(USBD_AUDIO_FREQ + 200);
+      } else if (new_fs < (int32_t)(USBD_AUDIO_FREQ - 200)) {
+        new_fs = (int32_t)(USBD_AUDIO_FREQ - 200);
       }
 
-      haudio->iso_cont.fs = USBD_AUDIO_FREQ - (ofs_diff * USBD_AUDIO_FREQ) / AUDIO_TOTAL_BUF_SIZE;
-
-      if (haudio->iso_cont.fs > (USBD_AUDIO_FREQ + 200)) haudio->iso_cont.fs = USBD_AUDIO_FREQ + 200;
-      if (haudio->iso_cont.fs < (USBD_AUDIO_FREQ - 200)) haudio->iso_cont.fs = USBD_AUDIO_FREQ - 200;
+      haudio->iso_cont.fs = (uint32_t)new_fs;
     }
 
     if ((haudio->wr_ptr + AUDIO_OUT_PACKET) > AUDIO_TOTAL_BUF_SIZE) {

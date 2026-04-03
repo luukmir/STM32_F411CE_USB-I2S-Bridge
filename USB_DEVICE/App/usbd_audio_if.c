@@ -154,6 +154,7 @@ USBD_AUDIO_ItfTypeDef USBD_AUDIO_fops_FS =
 static int8_t AUDIO_Init_FS(uint32_t AudioFreq, uint32_t Volume, uint32_t options)
 {
   /* USER CODE BEGIN 0 */
+  rxBufferReset();
   UNUSED(AudioFreq);
   UNUSED(Volume);
   UNUSED(options);
@@ -190,6 +191,7 @@ static int8_t AUDIO_AudioCmd_FS(uint8_t* pbuf, uint32_t size, uint8_t cmd)
   switch(cmd)
   {
     case AUDIO_CMD_START:
+      rxBufferReset();
     break;
 
     case AUDIO_CMD_PLAY:
