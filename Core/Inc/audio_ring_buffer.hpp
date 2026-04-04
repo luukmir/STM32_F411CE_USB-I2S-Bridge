@@ -48,7 +48,7 @@ public:
     size_t available = current_write - current_read;
 
     if (!isReady_) {
-      if (available >= (Size / 4)) {
+      if (available >= (Size / 2)) {
         isReady_ = true;
       }
     }

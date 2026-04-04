@@ -161,9 +161,9 @@ __ALIGN_BEGIN uint8_t USBD_FS_DeviceDesc[USB_LEN_DEV_DESC] __ALIGN_END =
                                              in order to support LPM L1 suspend
                                              resume test of USBCV3.0*/
 #else
-  0x00,                       /*bcdUSB */
+  0x10,                       /*bcdUSB */
 #endif /* (USBD_LPM_ENABLED == 1) */
-  0x02,
+  0x01,
   0x00,                       /*bDeviceClass*/
   0x00,                       /*bDeviceSubClass*/
   0x00,                       /*bDeviceProtocol*/

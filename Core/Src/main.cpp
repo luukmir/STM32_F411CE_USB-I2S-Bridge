@@ -1,20 +1,20 @@
 /* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : Main program body
+ ******************************************************************************
+ * @attention
+ *
+ * Copyright (c) 2026 STMicroelectronics.
+ * All rights reserved.
+ *
+ * This software is licensed under terms that can be found in the LICENSE file
+ * in the root directory of this software component.
+ * If no LICENSE file comes with this software, it is provided AS-IS.
+ *
+ ******************************************************************************
+ */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
@@ -48,7 +48,7 @@ constexpr uint32_t USBRingBufferSize{2048};
 namespace LinkSync {
 constexpr int16_t PatternWord{static_cast<int16_t>(0x96A5)};
 constexpr uint32_t RetryChunksBeforeRestart{32};
-}
+} // namespace LinkSync
 } // namespace AudioConfig
 
 /* USER CODE END PD */
@@ -66,12 +66,13 @@ TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
 __attribute__((aligned(32))) std::array<int16_t, AudioConfig::DMABufferSize>
-  txBuffer;
+    txBuffer;
 AudioRingBuffer<int16_t, AudioConfig::USBRingBufferSize> rxBuffer;
 volatile uint32_t gStreamLockAcquired{0};
 volatile uint32_t gDummyChunksWithoutLock{0};
 volatile uint32_t gRequestTxRestart{0};
 volatile uint32_t gH723ReadyWasAsserted{0};
+volatile int32_t d_available{0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -109,11 +110,10 @@ static bool restartI2STxDMA() {
 /* USER CODE END 0 */
 
 /**
-  * @brief  The application entry point.
-  * @retval int
-  */
-int main(void)
-{
+ * @brief  The application entry point.
+ * @retval int
+ */
+int main(void) {
 
   /* USER CODE BEGIN 1 */
 
@@ -121,7 +121,8 @@ int main(void)
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick.
+   */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -145,17 +146,17 @@ int main(void)
   setF411Ready(false);
 
   auto *pTx{reinterpret_cast<uint16_t *>(txBuffer.data())};
-	if (HAL_I2S_Transmit_DMA(&hi2s1, pTx, static_cast<uint16_t>(txBuffer.size())) != HAL_OK) {
-		Error_Handler();
-	}
+  if (HAL_I2S_Transmit_DMA(&hi2s1, pTx,
+                           static_cast<uint16_t>(txBuffer.size())) != HAL_OK) {
+    Error_Handler();
+  }
 
   setF411Ready(true);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
+  while (1) {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -170,22 +171,21 @@ int main(void)
 }
 
 /**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
+ * @brief System Clock Configuration
+ * @retval None
+ */
+void SystemClock_Config(void) {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
-  */
+   */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
   /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
+   * in the RCC_OscInitTypeDef structure.
+   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -194,33 +194,30 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLN = 192;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 4;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
     Error_Handler();
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+   */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+                                RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
-  {
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK) {
     Error_Handler();
   }
 }
 
 /**
-  * @brief I2S1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_I2S1_Init(void)
-{
+ * @brief I2S1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_I2S1_Init(void) {
 
   /* USER CODE BEGIN I2S1_Init 0 */
 
@@ -238,23 +235,20 @@ static void MX_I2S1_Init(void)
   hi2s1.Init.CPOL = I2S_CPOL_LOW;
   hi2s1.Init.ClockSource = I2S_CLOCK_PLL;
   hi2s1.Init.FullDuplexMode = I2S_FULLDUPLEXMODE_DISABLE;
-  if (HAL_I2S_Init(&hi2s1) != HAL_OK)
-  {
+  if (HAL_I2S_Init(&hi2s1) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN I2S1_Init 2 */
 
   /* USER CODE END I2S1_Init 2 */
-
 }
 
 /**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM2_Init(void)
-{
+ * @brief TIM2 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM2_Init(void) {
 
   /* USER CODE BEGIN TIM2_Init 0 */
 
@@ -272,35 +266,30 @@ static void MX_TIM2_Init(void)
   htim2.Init.Period = 4294967295;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-  {
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK) {
     Error_Handler();
   }
   sSlaveConfig.SlaveMode = TIM_SLAVEMODE_EXTERNAL1;
   sSlaveConfig.InputTrigger = TIM_TS_TI1FP1;
   sSlaveConfig.TriggerPolarity = TIM_TRIGGERPOLARITY_RISING;
   sSlaveConfig.TriggerFilter = 0;
-  if (HAL_TIM_SlaveConfigSynchro(&htim2, &sSlaveConfig) != HAL_OK)
-  {
+  if (HAL_TIM_SlaveConfigSynchro(&htim2, &sSlaveConfig) != HAL_OK) {
     Error_Handler();
   }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN TIM2_Init 2 */
 
   /* USER CODE END TIM2_Init 2 */
-
 }
 
 /**
-  * Enable DMA controller clock
-  */
-static void MX_DMA_Init(void)
-{
+ * Enable DMA controller clock
+ */
+static void MX_DMA_Init(void) {
 
   /* DMA controller clock enable */
   __HAL_RCC_DMA2_CLK_ENABLE();
@@ -309,19 +298,17 @@ static void MX_DMA_Init(void)
   /* DMA2_Stream2_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
-
 }
 
 /**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
+ * @brief GPIO Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_GPIO_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-/* USER CODE BEGIN MX_GPIO_Init_1 */
-/* USER CODE END MX_GPIO_Init_1 */
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+  /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOH_CLK_ENABLE();
@@ -344,110 +331,115 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-/* USER CODE BEGIN MX_GPIO_Init_2 */
-/* USER CODE END MX_GPIO_Init_2 */
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
 extern "C" {
-	void rxBufferReset() {
-		rxBuffer.reset();
-	}
-  int32_t rxBufferGetAvailableFrames() {
-    return static_cast<int32_t>(rxBuffer.getAvailableFrames());
+void rxBufferReset() {
+  rxBuffer.reset();
+  d_available = 0;
+}
+
+int32_t rxBufferGetAvailableFrames() {
+  return static_cast<int32_t>(rxBuffer.getAvailableFrames());
+}
+void rxBufferWrite(int16_t *data, uint32_t length) {
+  if (gStreamLockAcquired == 0U) {
+    d_available = 0;
+    return;
   }
-	void rxBufferWrite(int16_t *data, uint32_t length) {
-    if (gStreamLockAcquired == 0U) {
-      return;
-    }
 
-	  rxBuffer.write(data, length);
-	}
+  rxBuffer.write(data, length);
+  d_available = static_cast<int32_t>(rxBuffer.getAvailableSamples());
+}
 
-  static void handleAudioBlock(uint32_t start, uint32_t end) {
-    const bool h723ReadyNow =
-        HAL_GPIO_ReadPin(H723_READY_IN_GPIO_Port, H723_READY_IN_Pin) ==
-        GPIO_PIN_SET;
+static void handleAudioBlock(uint32_t start, uint32_t end) {
+  const bool h723ReadyNow = HAL_GPIO_ReadPin(H723_READY_IN_GPIO_Port,
+                                             H723_READY_IN_Pin) == GPIO_PIN_SET;
 
-    // If H723 restarts while F411 is running, force link re-sync from dummy mode.
-    if (!h723ReadyNow && gH723ReadyWasAsserted != 0U) {
-      gStreamLockAcquired = 0U;
+  // If H723 restarts while F411 is running, force link re-sync from dummy mode.
+  if (!h723ReadyNow && gH723ReadyWasAsserted != 0U) {
+    gStreamLockAcquired = 0U;
+    gDummyChunksWithoutLock = 0U;
+    gRequestTxRestart = 1U;
+    rxBuffer.reset();
+    d_available = 0;
+  }
+
+  if (gStreamLockAcquired == 0U && h723ReadyNow) {
+    gStreamLockAcquired = 1U;
+    gDummyChunksWithoutLock = 0U;
+  }
+
+  gH723ReadyWasAsserted = h723ReadyNow ? 1U : 0U;
+
+  if (gStreamLockAcquired == 0U) {
+    d_available = 0;
+    ++gDummyChunksWithoutLock;
+    if (gDummyChunksWithoutLock >=
+        AudioConfig::LinkSync::RetryChunksBeforeRestart) {
       gDummyChunksWithoutLock = 0U;
       gRequestTxRestart = 1U;
-      rxBuffer.reset();
     }
 
-    if (gStreamLockAcquired == 0U && h723ReadyNow) {
-      gStreamLockAcquired = 1U;
-      gDummyChunksWithoutLock = 0U;
+    for (uint32_t i = start; i < end; ++i) {
+      txBuffer[i] = AudioConfig::LinkSync::PatternWord;
     }
+    return;
+  }
 
-    gH723ReadyWasAsserted = h723ReadyNow ? 1U : 0U;
+  static std::array<int16_t, AudioConfig::HalfDMABufferSize> tempBuf;
 
-    if (gStreamLockAcquired == 0U) {
-      ++gDummyChunksWithoutLock;
-      if (gDummyChunksWithoutLock >= AudioConfig::LinkSync::RetryChunksBeforeRestart) {
-        gDummyChunksWithoutLock = 0U;
-        gRequestTxRestart = 1U;
-      }
+  const uint32_t numSamples{end - start};
+  rxBuffer.read(tempBuf.data(), numSamples);
+  d_available = static_cast<int32_t>(rxBuffer.getAvailableSamples());
 
-      for (uint32_t i = start; i < end; ++i) {
-        txBuffer[i] = AudioConfig::LinkSync::PatternWord;
-      }
-      return;
-    }
-
-    static std::array<int16_t, AudioConfig::HalfDMABufferSize> tempBuf;
-
-    const uint32_t numSamples{end - start};
-    rxBuffer.read(tempBuf.data(), numSamples);
-
-    for (uint32_t i = start, j = 0; i < end; ++i, ++j) {
-      txBuffer[i] = tempBuf[j];
-    }
-	}
-	void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s) {
-		if (hi2s == &hi2s1) {
-			handleAudioBlock(0, AudioConfig::HalfDMABufferSize);
-		}
-	}
-	void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s) {
-		if (hi2s == &hi2s1) {
-			handleAudioBlock(AudioConfig::HalfDMABufferSize,
-			                 AudioConfig::DMABufferSize);
-		}
-	}
+  for (uint32_t i = start, j = 0; i < end; ++i, ++j) {
+    txBuffer[i] = tempBuf[j];
+  }
+}
+void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s) {
+  if (hi2s == &hi2s1) {
+    handleAudioBlock(0, AudioConfig::HalfDMABufferSize);
+  }
+}
+void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s) {
+  if (hi2s == &hi2s1) {
+    handleAudioBlock(AudioConfig::HalfDMABufferSize,
+                     AudioConfig::DMABufferSize);
+  }
+}
 }
 /* USER CODE END 4 */
 
 /**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void) {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
-  while (1)
-  {
+  while (1) {
   }
   /* USER CODE END Error_Handler_Debug */
 }
 
-#ifdef  USE_FULL_ASSERT
+#ifdef USE_FULL_ASSERT
 /**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
+ * @brief  Reports the name of the source file and the source line number
+ *         where the assert_param error has occurred.
+ * @param  file: pointer to the source file name
+ * @param  line: assert_param error line source number
+ * @retval None
+ */
+void assert_failed(uint8_t *file, uint32_t line) {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* User can add his own implementation to report the file name and line
+     number, ex: printf("Wrong parameters value: file %s on line %d\r\n", file,
+     line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
