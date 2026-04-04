@@ -44,6 +44,11 @@ constexpr uint32_t SamplesPerBlock{FramesPerBlock * Channels};
 constexpr uint32_t DMABufferSize{SamplesPerBlock * 2};
 constexpr uint32_t HalfDMABufferSize{DMABufferSize / 2};
 constexpr uint32_t USBRingBufferSize{2048};
+
+namespace LinkSync {
+constexpr int16_t PatternWord{static_cast<int16_t>(0x96A5)};
+constexpr uint32_t RetryChunksBeforeRestart{32};
+}
 } // namespace AudioConfig
 
 /* USER CODE END PD */
@@ -63,6 +68,10 @@ TIM_HandleTypeDef htim2;
 __attribute__((aligned(32))) std::array<int16_t, AudioConfig::DMABufferSize>
   txBuffer;
 AudioRingBuffer<int16_t, AudioConfig::USBRingBufferSize> rxBuffer;
+volatile uint32_t gStreamLockAcquired{0};
+volatile uint32_t gDummyChunksWithoutLock{0};
+volatile uint32_t gRequestTxRestart{0};
+volatile uint32_t gH723ReadyWasAsserted{0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -77,6 +86,25 @@ static void MX_TIM2_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void setF411Ready(bool active) {
+  HAL_GPIO_WritePin(F411_READY_OUT_GPIO_Port, F411_READY_OUT_Pin,
+                    active ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static bool restartI2STxDMA() {
+  auto *pTx{reinterpret_cast<uint16_t *>(txBuffer.data())};
+
+  setF411Ready(false);
+  if (HAL_I2S_DMAStop(&hi2s1) != HAL_OK) {
+    return false;
+  }
+  if (HAL_I2S_Transmit_DMA(&hi2s1, pTx,
+                           static_cast<uint16_t>(txBuffer.size())) != HAL_OK) {
+    return false;
+  }
+  setF411Ready(true);
+  return true;
+}
 
 /* USER CODE END 0 */
 
@@ -114,10 +142,14 @@ int main(void)
   MX_I2S1_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+  setF411Ready(false);
+
   auto *pTx{reinterpret_cast<uint16_t *>(txBuffer.data())};
 	if (HAL_I2S_Transmit_DMA(&hi2s1, pTx, static_cast<uint16_t>(txBuffer.size())) != HAL_OK) {
 		Error_Handler();
 	}
+
+  setF411Ready(true);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -127,6 +159,12 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    if (gRequestTxRestart != 0U && gStreamLockAcquired == 0U) {
+      gRequestTxRestart = 0U;
+      if (!restartI2STxDMA()) {
+        Error_Handler();
+      }
+    }
   }
   /* USER CODE END 3 */
 }
@@ -281,6 +319,7 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
 /* USER CODE BEGIN MX_GPIO_Init_1 */
 /* USER CODE END MX_GPIO_Init_1 */
 
@@ -288,6 +327,22 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PA1 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
@@ -302,10 +357,46 @@ extern "C" {
     return static_cast<int32_t>(rxBuffer.getAvailableFrames());
   }
 	void rxBufferWrite(int16_t *data, uint32_t length) {
+    if (gStreamLockAcquired == 0U) {
+      return;
+    }
+
 	  rxBuffer.write(data, length);
 	}
 
   static void handleAudioBlock(uint32_t start, uint32_t end) {
+    const bool h723ReadyNow =
+        HAL_GPIO_ReadPin(H723_READY_IN_GPIO_Port, H723_READY_IN_Pin) ==
+        GPIO_PIN_SET;
+
+    // If H723 restarts while F411 is running, force link re-sync from dummy mode.
+    if (!h723ReadyNow && gH723ReadyWasAsserted != 0U) {
+      gStreamLockAcquired = 0U;
+      gDummyChunksWithoutLock = 0U;
+      gRequestTxRestart = 1U;
+      rxBuffer.reset();
+    }
+
+    if (gStreamLockAcquired == 0U && h723ReadyNow) {
+      gStreamLockAcquired = 1U;
+      gDummyChunksWithoutLock = 0U;
+    }
+
+    gH723ReadyWasAsserted = h723ReadyNow ? 1U : 0U;
+
+    if (gStreamLockAcquired == 0U) {
+      ++gDummyChunksWithoutLock;
+      if (gDummyChunksWithoutLock >= AudioConfig::LinkSync::RetryChunksBeforeRestart) {
+        gDummyChunksWithoutLock = 0U;
+        gRequestTxRestart = 1U;
+      }
+
+      for (uint32_t i = start; i < end; ++i) {
+        txBuffer[i] = AudioConfig::LinkSync::PatternWord;
+      }
+      return;
+    }
+
     static std::array<int16_t, AudioConfig::HalfDMABufferSize> tempBuf;
 
     const uint32_t numSamples{end - start};

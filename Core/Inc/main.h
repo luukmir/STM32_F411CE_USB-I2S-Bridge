@@ -59,6 +59,10 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 
 /* USER CODE BEGIN Private defines */
+#define H723_READY_IN_Pin GPIO_PIN_1
+#define H723_READY_IN_GPIO_Port GPIOA
+#define F411_READY_OUT_Pin GPIO_PIN_2
+#define F411_READY_OUT_GPIO_Port GPIOA
 
 /* USER CODE END Private defines */
 
