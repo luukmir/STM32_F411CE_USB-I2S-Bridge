@@ -22,7 +22,6 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "usbd_audio_if.h"
 #include "audio_ring_buffer.hpp"
 
 #include <array>
@@ -37,6 +36,15 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+namespace AudioConfig {
+constexpr uint32_t SampleRate{48000};
+constexpr uint32_t Channels{2};
+constexpr uint32_t FramesPerBlock{SampleRate / 1000};
+constexpr uint32_t SamplesPerBlock{FramesPerBlock * Channels};
+constexpr uint32_t DMABufferSize{SamplesPerBlock * 2};
+constexpr uint32_t HalfDMABufferSize{DMABufferSize / 2};
+constexpr uint32_t USBRingBufferSize{2048};
+} // namespace AudioConfig
 
 /* USER CODE END PD */
 
@@ -52,8 +60,9 @@ DMA_HandleTypeDef hdma_spi1_tx;
 TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
-__attribute__((aligned(32))) std::array<int16_t, 192> txBuffer;
-AudioRingBuffer<int16_t, 2048> rxBuffer;
+__attribute__((aligned(32))) std::array<int16_t, AudioConfig::DMABufferSize>
+  txBuffer;
+AudioRingBuffer<int16_t, AudioConfig::USBRingBufferSize> rxBuffer;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -295,28 +304,26 @@ extern "C" {
 	void rxBufferWrite(int16_t *data, uint32_t length) {
 	  rxBuffer.write(data, length);
 	}
-  void processAudio(uint32_t start, uint32_t numSamples) {
-    static std::array<int16_t, 96> tempBuf;
 
-    uint32_t samplesToRead = numSamples;
-    if (samplesToRead > tempBuf.size()) {
-      samplesToRead = static_cast<uint32_t>(tempBuf.size());
-    }
+  static void handleAudioBlock(uint32_t start, uint32_t end) {
+    static std::array<int16_t, AudioConfig::HalfDMABufferSize> tempBuf;
 
-    rxBuffer.read(tempBuf.data(), samplesToRead);
+    const uint32_t numSamples{end - start};
+    rxBuffer.read(tempBuf.data(), numSamples);
 
-    for (uint32_t j = 0; j < samplesToRead; ++j) {
-      txBuffer[start + j] = tempBuf[j];
+    for (uint32_t i = start, j = 0; i < end; ++i, ++j) {
+      txBuffer[i] = tempBuf[j];
     }
 	}
 	void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s) {
 		if (hi2s == &hi2s1) {
-      processAudio(0, 96U);
+			handleAudioBlock(0, AudioConfig::HalfDMABufferSize);
 		}
 	}
 	void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s) {
 		if (hi2s == &hi2s1) {
-      processAudio(96U, 96U);
+			handleAudioBlock(AudioConfig::HalfDMABufferSize,
+			                 AudioConfig::DMABufferSize);
 		}
 	}
 }
