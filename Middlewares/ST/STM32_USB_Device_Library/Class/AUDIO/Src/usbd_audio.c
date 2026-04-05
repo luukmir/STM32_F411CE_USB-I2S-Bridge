@@ -131,7 +131,13 @@ static uint8_t USBD_AUDIO_SOF(USBD_HandleTypeDef *pdev);
 static uint8_t USBD_AUDIO_IsoINIncomplete(USBD_HandleTypeDef *pdev, uint8_t epnum);
 static uint8_t USBD_AUDIO_IsoOutIncomplete(USBD_HandleTypeDef *pdev, uint8_t epnum);
 static void AUDIO_REQ_GetCurrent(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
+static void AUDIO_REQ_GetMin(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
+static void AUDIO_REQ_GetMax(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
+static void AUDIO_REQ_GetRes(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
 static void AUDIO_REQ_SetCurrent(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
+static uint32_t AUDIO_ComputeFeedbackFs(int32_t available_frames);
+static void AUDIO_UpdateFeedbackRate(USBD_AUDIO_HandleTypeDef *haudio);
+static int32_t AUDIO_ApplyDeadband(int32_t frame_error);
 static void *USBD_AUDIO_GetAudioHeaderDesc(uint8_t *pConfDesc);
 
 /**
@@ -141,6 +147,27 @@ static void *USBD_AUDIO_GetAudioHeaderDesc(uint8_t *pConfDesc);
 /** @defgroup USBD_AUDIO_Private_Variables
   * @{
   */
+
+/* Volume range in 1/256 dB units (UAC1 format): -80 dB .. +6 dB, 0.5 dB step. */
+#define AUDIO_VOLUME_MIN_DB_256 ((int16_t)-20480)
+#define AUDIO_VOLUME_MAX_DB_256 ((int16_t)1536)
+#define AUDIO_VOLUME_RES_DB_256 ((int16_t)128)
+
+/* Async feedback loop tuning for host compatibility and underrun resilience. */
+#define AUDIO_FB_TARGET_FRAMES               ((int32_t)512)
+#define AUDIO_FB_UPDATE_INTERVAL_PACKETS     ((uint16_t)2U)
+#define AUDIO_FB_DEADBAND_FRAMES             ((int32_t)8)
+#define AUDIO_FB_KP_NUM                       ((int32_t)3)
+#define AUDIO_FB_KP_DEN                       ((int32_t)2)
+#define AUDIO_FB_KI_NUM                       ((int32_t)1)
+#define AUDIO_FB_KI_DEN                       ((int32_t)64)
+#define AUDIO_FB_I_LIMIT_HZ                   ((int32_t)300)
+#define AUDIO_FB_MAX_DEVIATION_HZ            ((int32_t)600)
+#define AUDIO_FB_UNDERRUN_GUARD_FRAMES       ((int32_t)128)
+
+static uint8_t audio_cur_mute = 0U;
+static int16_t audio_cur_volume_db_256 = 0;
+static int32_t audio_fb_integral_hz = 0;
 
 USBD_ClassTypeDef USBD_AUDIO =
 {
@@ -234,7 +261,7 @@ __ALIGN_BEGIN static uint8_t
         AUDIO_OUT_STREAMING_CTRL,        /* bUnitID */
         0x01,                            /* bSourceID */
         0x01,                            /* bControlSize */
-        AUDIO_CONTROL_MUTE,              /* bmaControls(0) */
+        (AUDIO_CONTROL_MUTE | AUDIO_CONTROL_VOLUME), /* bmaControls(0) */
         0,                               /* bmaControls(1) */
         0x00,                            /* iTerminal */
         /* 09 byte */
@@ -356,6 +383,85 @@ __ALIGN_BEGIN static uint8_t USBD_AUDIO_DeviceQualifierDesc[USB_LEN_DEV_QUALIFIE
 
 static uint8_t AUDIOOutEpAdd = AUDIO_OUT_EP;
 static uint8_t AUDIOInEpAdd = AUDIO_IN_EP;
+
+static int32_t AUDIO_ApplyDeadband(int32_t frame_error)
+{
+  if (frame_error > AUDIO_FB_DEADBAND_FRAMES)
+  {
+    return frame_error - AUDIO_FB_DEADBAND_FRAMES;
+  }
+
+  if (frame_error < -AUDIO_FB_DEADBAND_FRAMES)
+  {
+    return frame_error + AUDIO_FB_DEADBAND_FRAMES;
+  }
+
+  return 0;
+}
+
+static uint32_t AUDIO_ComputeFeedbackFs(int32_t available_frames)
+{
+  const int32_t frame_error =
+      AUDIO_ApplyDeadband(available_frames - AUDIO_FB_TARGET_FRAMES);
+  const int32_t p_correction_hz = (frame_error * AUDIO_FB_KP_NUM) / AUDIO_FB_KP_DEN;
+  const int32_t i_step_hz = (frame_error * AUDIO_FB_KI_NUM) / AUDIO_FB_KI_DEN;
+  int32_t i_candidate_hz = audio_fb_integral_hz + i_step_hz;
+  int32_t correction_hz;
+  int32_t next_fs;
+  int32_t fs_max = (int32_t)USBD_AUDIO_FREQ + AUDIO_FB_MAX_DEVIATION_HZ;
+  int32_t fs_min = (int32_t)USBD_AUDIO_FREQ - AUDIO_FB_MAX_DEVIATION_HZ;
+
+  if (i_candidate_hz > AUDIO_FB_I_LIMIT_HZ)
+  {
+    i_candidate_hz = AUDIO_FB_I_LIMIT_HZ;
+  }
+  else if (i_candidate_hz < -AUDIO_FB_I_LIMIT_HZ)
+  {
+    i_candidate_hz = -AUDIO_FB_I_LIMIT_HZ;
+  }
+
+  correction_hz = p_correction_hz + i_candidate_hz;
+  next_fs = (int32_t)USBD_AUDIO_FREQ - correction_hz;
+
+  if (available_frames < AUDIO_FB_UNDERRUN_GUARD_FRAMES)
+  {
+    next_fs = fs_max;
+    if (audio_fb_integral_hz > 0)
+    {
+      audio_fb_integral_hz = 0;
+    }
+    return (uint32_t)next_fs;
+  }
+
+  if (next_fs > fs_max)
+  {
+    next_fs = fs_max;
+    if (i_step_hz >= 0)
+    {
+      audio_fb_integral_hz = i_candidate_hz;
+    }
+  }
+  else if (next_fs < fs_min)
+  {
+    next_fs = fs_min;
+    if (i_step_hz <= 0)
+    {
+      audio_fb_integral_hz = i_candidate_hz;
+    }
+  }
+  else
+  {
+    audio_fb_integral_hz = i_candidate_hz;
+  }
+
+  return (uint32_t)next_fs;
+}
+
+static void AUDIO_UpdateFeedbackRate(USBD_AUDIO_HandleTypeDef *haudio)
+{
+  int32_t available_frames = rxBufferGetAvailableFrames();
+  haudio->iso_cont.fs = AUDIO_ComputeFeedbackFs(available_frames);
+}
 /**
   * @}
   */
@@ -429,6 +535,7 @@ static uint8_t USBD_AUDIO_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   haudio->iso_cont.usbintn = 0U;
   haudio->iso_cont.tx_flag = 1U;
   haudio->iso_cont.ofs_packet = 0;
+  audio_fb_integral_hz = 0;
   /* USER CODE END */
 
   /* Initialize the Audio output Hardware layer */
@@ -528,6 +635,18 @@ static uint8_t USBD_AUDIO_Setup(USBD_HandleTypeDef *pdev,
       {
         case AUDIO_REQ_GET_CUR:
           AUDIO_REQ_GetCurrent(pdev, req);
+          break;
+
+        case AUDIO_REQ_GET_MIN:
+          AUDIO_REQ_GetMin(pdev, req);
+          break;
+
+        case AUDIO_REQ_GET_MAX:
+          AUDIO_REQ_GetMax(pdev, req);
+          break;
+
+        case AUDIO_REQ_GET_RES:
+          AUDIO_REQ_GetRes(pdev, req);
           break;
 
         case AUDIO_REQ_SET_CUR:
@@ -684,11 +803,31 @@ static uint8_t USBD_AUDIO_EP0_RxReady(USBD_HandleTypeDef *pdev)
 
   if (haudio->control.cmd == AUDIO_REQ_SET_CUR)
   {
-    /* In this driver, to simplify code, only SET_CUR request is managed */
-
     if (haudio->control.unit == AUDIO_OUT_STREAMING_CTRL)
     {
-      ((USBD_AUDIO_ItfTypeDef *)pdev->pUserData[pdev->classId])->MuteCtl(haudio->control.data[0]);
+      if (haudio->control.cs == AUDIO_CONTROL_MUTE)
+      {
+        audio_cur_mute = haudio->control.data[0];
+        ((USBD_AUDIO_ItfTypeDef *)pdev->pUserData[pdev->classId])->MuteCtl(audio_cur_mute);
+      }
+      else if ((haudio->control.cs == AUDIO_CONTROL_VOLUME) && (haudio->control.len >= 2U))
+      {
+        int16_t vol_db_256 = (int16_t)((uint16_t)haudio->control.data[0] |
+                                       ((uint16_t)haudio->control.data[1] << 8));
+
+        if (vol_db_256 < AUDIO_VOLUME_MIN_DB_256)
+        {
+          vol_db_256 = AUDIO_VOLUME_MIN_DB_256;
+        }
+        else if (vol_db_256 > AUDIO_VOLUME_MAX_DB_256)
+        {
+          vol_db_256 = AUDIO_VOLUME_MAX_DB_256;
+        }
+
+        audio_cur_volume_db_256 = vol_db_256;
+        ((USBD_AUDIO_ItfTypeDef *)pdev->pUserData[pdev->classId])->VolumeCtl(0U);
+      }
+
       haudio->control.cmd = 0U;
       haudio->control.len = 0U;
     }
@@ -931,20 +1070,8 @@ static uint8_t USBD_AUDIO_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum) {
     /* USER CODE BEGIN */
     haudio->iso_cont.usbintn++;
 
-    if ((haudio->iso_cont.usbintn % 4) == 0) {
-      int32_t available_frames = rxBufferGetAvailableFrames();
-      int32_t target_frames = 512;
-      int32_t frame_diff = available_frames - target_frames;
-
-      int32_t new_fs = (int32_t)USBD_AUDIO_FREQ - frame_diff;
-
-      if (new_fs > (int32_t)(USBD_AUDIO_FREQ + 200)) {
-        new_fs = (int32_t)(USBD_AUDIO_FREQ + 200);
-      } else if (new_fs < (int32_t)(USBD_AUDIO_FREQ - 200)) {
-        new_fs = (int32_t)(USBD_AUDIO_FREQ - 200);
-      }
-
-      haudio->iso_cont.fs = (uint32_t)new_fs;
+    if ((haudio->iso_cont.usbintn % AUDIO_FB_UPDATE_INTERVAL_PACKETS) == 0U) {
+      AUDIO_UpdateFeedbackRate(haudio);
     }
 
     if ((haudio->wr_ptr + AUDIO_OUT_PACKET) > AUDIO_TOTAL_BUF_SIZE) {
@@ -959,6 +1086,7 @@ static uint8_t USBD_AUDIO_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum) {
 
         /* USER CODE BEGIN */
         haudio->iso_cont.tx_flag = 0U;
+        audio_fb_integral_hz = 0;
         /* USER CODE END */
       }
     }
@@ -982,6 +1110,8 @@ static uint8_t USBD_AUDIO_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum) {
 static void AUDIO_REQ_GetCurrent(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
 {
   USBD_AUDIO_HandleTypeDef *haudio;
+  uint8_t cs;
+
   haudio = (USBD_AUDIO_HandleTypeDef *)pdev->pClassDataCmsit[pdev->classId];
 
   if (haudio == NULL)
@@ -990,8 +1120,102 @@ static void AUDIO_REQ_GetCurrent(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef 
   }
 
   (void)USBD_memset(haudio->control.data, 0, USB_MAX_EP0_SIZE);
+  cs = HIBYTE(req->wValue);
 
-  /* Send the current mute state */
+  if ((HIBYTE(req->wIndex) == AUDIO_OUT_STREAMING_CTRL) && (cs == AUDIO_CONTROL_MUTE))
+  {
+    haudio->control.data[0] = audio_cur_mute;
+  }
+  else if ((HIBYTE(req->wIndex) == AUDIO_OUT_STREAMING_CTRL) && (cs == AUDIO_CONTROL_VOLUME))
+  {
+    haudio->control.data[0] = (uint8_t)((uint16_t)audio_cur_volume_db_256 & 0xFFU);
+    haudio->control.data[1] = (uint8_t)(((uint16_t)audio_cur_volume_db_256 >> 8) & 0xFFU);
+  }
+
+  (void)USBD_CtlSendData(pdev, haudio->control.data,
+                         MIN(req->wLength, USB_MAX_EP0_SIZE));
+}
+
+/**
+  * @brief  Handles GET_MIN Audio control request.
+  * @param  pdev: device instance
+  * @param  req: setup class request
+  * @retval None
+  */
+static void AUDIO_REQ_GetMin(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
+{
+  USBD_AUDIO_HandleTypeDef *haudio;
+
+  haudio = (USBD_AUDIO_HandleTypeDef *)pdev->pClassDataCmsit[pdev->classId];
+
+  if (haudio == NULL)
+  {
+    return;
+  }
+
+  (void)USBD_memset(haudio->control.data, 0, USB_MAX_EP0_SIZE);
+  if ((HIBYTE(req->wIndex) == AUDIO_OUT_STREAMING_CTRL) && (HIBYTE(req->wValue) == AUDIO_CONTROL_VOLUME))
+  {
+    haudio->control.data[0] = (uint8_t)((uint16_t)AUDIO_VOLUME_MIN_DB_256 & 0xFFU);
+    haudio->control.data[1] = (uint8_t)(((uint16_t)AUDIO_VOLUME_MIN_DB_256 >> 8) & 0xFFU);
+  }
+
+  (void)USBD_CtlSendData(pdev, haudio->control.data,
+                         MIN(req->wLength, USB_MAX_EP0_SIZE));
+}
+
+/**
+  * @brief  Handles GET_MAX Audio control request.
+  * @param  pdev: device instance
+  * @param  req: setup class request
+  * @retval None
+  */
+static void AUDIO_REQ_GetMax(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
+{
+  USBD_AUDIO_HandleTypeDef *haudio;
+
+  haudio = (USBD_AUDIO_HandleTypeDef *)pdev->pClassDataCmsit[pdev->classId];
+
+  if (haudio == NULL)
+  {
+    return;
+  }
+
+  (void)USBD_memset(haudio->control.data, 0, USB_MAX_EP0_SIZE);
+  if ((HIBYTE(req->wIndex) == AUDIO_OUT_STREAMING_CTRL) && (HIBYTE(req->wValue) == AUDIO_CONTROL_VOLUME))
+  {
+    haudio->control.data[0] = (uint8_t)((uint16_t)AUDIO_VOLUME_MAX_DB_256 & 0xFFU);
+    haudio->control.data[1] = (uint8_t)(((uint16_t)AUDIO_VOLUME_MAX_DB_256 >> 8) & 0xFFU);
+  }
+
+  (void)USBD_CtlSendData(pdev, haudio->control.data,
+                         MIN(req->wLength, USB_MAX_EP0_SIZE));
+}
+
+/**
+  * @brief  Handles GET_RES Audio control request.
+  * @param  pdev: device instance
+  * @param  req: setup class request
+  * @retval None
+  */
+static void AUDIO_REQ_GetRes(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
+{
+  USBD_AUDIO_HandleTypeDef *haudio;
+
+  haudio = (USBD_AUDIO_HandleTypeDef *)pdev->pClassDataCmsit[pdev->classId];
+
+  if (haudio == NULL)
+  {
+    return;
+  }
+
+  (void)USBD_memset(haudio->control.data, 0, USB_MAX_EP0_SIZE);
+  if ((HIBYTE(req->wIndex) == AUDIO_OUT_STREAMING_CTRL) && (HIBYTE(req->wValue) == AUDIO_CONTROL_VOLUME))
+  {
+    haudio->control.data[0] = (uint8_t)((uint16_t)AUDIO_VOLUME_RES_DB_256 & 0xFFU);
+    haudio->control.data[1] = (uint8_t)(((uint16_t)AUDIO_VOLUME_RES_DB_256 >> 8) & 0xFFU);
+  }
+
   (void)USBD_CtlSendData(pdev, haudio->control.data,
                          MIN(req->wLength, USB_MAX_EP0_SIZE));
 }
@@ -1018,6 +1242,7 @@ static void AUDIO_REQ_SetCurrent(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef 
     haudio->control.cmd = AUDIO_REQ_SET_CUR;     /* Set the request value */
     haudio->control.len = (uint8_t)MIN(req->wLength, USB_MAX_EP0_SIZE);  /* Set the request data length */
     haudio->control.unit = HIBYTE(req->wIndex);  /* Set the request target unit */
+    haudio->control.cs = HIBYTE(req->wValue);    /* Control selector (Mute / Volume) */
 
     /* Prepare the reception of the buffer over EP0 */
     (void)USBD_CtlPrepareRx(pdev, haudio->control.data, haudio->control.len);
@@ -1055,6 +1280,11 @@ uint8_t USBD_AUDIO_RegisterInterface(USBD_HandleTypeDef *pdev,
   pdev->pUserData[pdev->classId] = fops;
 
   return (uint8_t)USBD_OK;
+}
+
+int16_t USBD_AUDIO_GetCurrentVolumeDb256(void)
+{
+  return audio_cur_volume_db_256;
 }
 
 #ifdef USE_USBD_COMPOSITE

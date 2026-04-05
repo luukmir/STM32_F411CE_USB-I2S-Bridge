@@ -25,6 +25,7 @@
 #include "audio_ring_buffer.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 
 /* USER CODE END Includes */
@@ -44,6 +45,21 @@ constexpr uint32_t SamplesPerBlock{FramesPerBlock * Channels};
 constexpr uint32_t DMABufferSize{SamplesPerBlock * 2};
 constexpr uint32_t HalfDMABufferSize{DMABufferSize / 2};
 constexpr uint32_t USBRingBufferSize{2048};
+
+namespace VolumeCurve {
+constexpr int16_t MinDb256{-20480};
+constexpr int16_t MaxDb256{1536};
+constexpr float MinDb{-80.0f};
+constexpr float MaxDb{6.0f};
+constexpr float LiftGamma{0.65f};
+
+constexpr uint32_t Q15Unity{32768U};
+constexpr uint32_t Q15Max{65535U};
+constexpr int32_t AudioSampleMin{-32768};
+constexpr int32_t AudioSampleMax{32767};
+constexpr int32_t Q15RoundOffset{1 << 14};
+constexpr int32_t Q15Shift{15};
+} // namespace VolumeCurve
 
 namespace LinkSync {
 constexpr int16_t PatternWord{static_cast<int16_t>(0x96A5)};
@@ -73,6 +89,8 @@ volatile uint32_t gDummyChunksWithoutLock{0};
 volatile uint32_t gRequestTxRestart{0};
 volatile uint32_t gH723ReadyWasAsserted{0};
 volatile int32_t d_available{0};
+volatile uint32_t gUsbGainQ15{AudioConfig::VolumeCurve::Q15Unity};
+volatile uint32_t gUsbMute{0U};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -92,7 +110,7 @@ static void setF411Ready(bool active) {
                     active ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-static bool restartI2STxDMA() {
+static bool restartI2STxDma() {
   auto *pTx{reinterpret_cast<uint16_t *>(txBuffer.data())};
 
   setF411Ready(false);
@@ -105,6 +123,121 @@ static bool restartI2STxDMA() {
   }
   setF411Ready(true);
   return true;
+}
+
+static float clamp01(float v) {
+  if (v < 0.0f) {
+    return 0.0f;
+  }
+  if (v > 1.0f) {
+    return 1.0f;
+  }
+  return v;
+}
+
+static uint32_t volumeDb256ToQ15(int16_t volDb256) {
+  int16_t clampedDb256 = volDb256;
+  if (clampedDb256 < AudioConfig::VolumeCurve::MinDb256) {
+    clampedDb256 = AudioConfig::VolumeCurve::MinDb256;
+  } else if (clampedDb256 > AudioConfig::VolumeCurve::MaxDb256) {
+    clampedDb256 = AudioConfig::VolumeCurve::MaxDb256;
+  }
+
+  const float rawDb = static_cast<float>(clampedDb256) / 256.0f;
+  const float normalized =
+      (rawDb - AudioConfig::VolumeCurve::MinDb) /
+      (AudioConfig::VolumeCurve::MaxDb - AudioConfig::VolumeCurve::MinDb);
+  const float shaped = powf(clamp01(normalized), AudioConfig::VolumeCurve::LiftGamma);
+  const float effectiveDb =
+      AudioConfig::VolumeCurve::MinDb +
+      (AudioConfig::VolumeCurve::MaxDb - AudioConfig::VolumeCurve::MinDb) * shaped;
+
+  const float gain = powf(10.0f, effectiveDb / 20.0f);
+  int32_t gainQ15 = static_cast<int32_t>(gain * static_cast<float>(AudioConfig::VolumeCurve::Q15Unity) + 0.5f);
+
+  if (gainQ15 < 0) {
+    gainQ15 = 0;
+  } else if (gainQ15 > static_cast<int32_t>(AudioConfig::VolumeCurve::Q15Max)) {
+    gainQ15 = static_cast<int32_t>(AudioConfig::VolumeCurve::Q15Max);
+  }
+
+  return static_cast<uint32_t>(gainQ15);
+}
+
+static int16_t scaleAndSaturateSampleQ15(int16_t sample, uint32_t gainQ15) {
+  int32_t scaled =
+      (static_cast<int32_t>(sample) * static_cast<int32_t>(gainQ15) +
+       AudioConfig::VolumeCurve::Q15RoundOffset) >>
+      AudioConfig::VolumeCurve::Q15Shift;
+
+  if (scaled > AudioConfig::VolumeCurve::AudioSampleMax) {
+    scaled = AudioConfig::VolumeCurve::AudioSampleMax;
+  } else if (scaled < AudioConfig::VolumeCurve::AudioSampleMin) {
+    scaled = AudioConfig::VolumeCurve::AudioSampleMin;
+  }
+
+  return static_cast<int16_t>(scaled);
+}
+
+static void resetLinkSyncState() {
+  gStreamLockAcquired = 0U;
+  gDummyChunksWithoutLock = 0U;
+  gRequestTxRestart = 1U;
+  rxBuffer.reset();
+  d_available = 0;
+}
+
+static bool updateStreamLockState(bool h723ReadyNow) {
+  if (!h723ReadyNow && gH723ReadyWasAsserted != 0U) {
+    resetLinkSyncState();
+  }
+
+  if (gStreamLockAcquired == 0U && h723ReadyNow) {
+    gStreamLockAcquired = 1U;
+    gDummyChunksWithoutLock = 0U;
+  }
+
+  gH723ReadyWasAsserted = h723ReadyNow ? 1U : 0U;
+  return gStreamLockAcquired != 0U;
+}
+
+static void renderDummyAudioBlock(uint32_t start, uint32_t end) {
+  d_available = 0;
+  ++gDummyChunksWithoutLock;
+  if (gDummyChunksWithoutLock >= AudioConfig::LinkSync::RetryChunksBeforeRestart) {
+    gDummyChunksWithoutLock = 0U;
+    gRequestTxRestart = 1U;
+  }
+
+  for (uint32_t i = start; i < end; ++i) {
+    txBuffer[i] = AudioConfig::LinkSync::PatternWord;
+  }
+}
+
+static void renderUsbAudioBlock(uint32_t start, uint32_t end) {
+  static std::array<int16_t, AudioConfig::HalfDMABufferSize> tempBuf;
+
+  const uint32_t numSamples{end - start};
+  rxBuffer.read(tempBuf.data(), numSamples);
+  d_available = static_cast<int32_t>(rxBuffer.getAvailableSamples());
+
+  const uint32_t gainQ15 = (gUsbMute != 0U) ? 0U : gUsbGainQ15;
+
+  for (uint32_t i = start, j = 0; i < end; ++i, ++j) {
+    txBuffer[i] = scaleAndSaturateSampleQ15(tempBuf[j], gainQ15);
+  }
+}
+
+static void handleAudioBlock(uint32_t start, uint32_t end) {
+  const bool h723ReadyNow = HAL_GPIO_ReadPin(H723_READY_IN_GPIO_Port,
+                                             H723_READY_IN_Pin) == GPIO_PIN_SET;
+
+  if (!updateStreamLockState(h723ReadyNow)) {
+    renderDummyAudioBlock(start, end);
+    return;
+  }
+
+  renderUsbAudioBlock(start, end);
 }
 
 /* USER CODE END 0 */
@@ -162,7 +295,7 @@ int main(void) {
     /* USER CODE BEGIN 3 */
     if (gRequestTxRestart != 0U && gStreamLockAcquired == 0U) {
       gRequestTxRestart = 0U;
-      if (!restartI2STxDMA()) {
+      if (!restartI2STxDma()) {
         Error_Handler();
       }
     }
@@ -337,6 +470,12 @@ static void MX_GPIO_Init(void) {
 
 /* USER CODE BEGIN 4 */
 extern "C" {
+void setUsbVolumeDb256(int16_t volDb256) {
+  gUsbGainQ15 = volumeDb256ToQ15(volDb256);
+}
+
+void setUsbMuteState(uint8_t mute) { gUsbMute = (mute != 0U) ? 1U : 0U; }
+
 void rxBufferReset() {
   rxBuffer.reset();
   d_available = 0;
@@ -353,52 +492,6 @@ void rxBufferWrite(int16_t *data, uint32_t length) {
 
   rxBuffer.write(data, length);
   d_available = static_cast<int32_t>(rxBuffer.getAvailableSamples());
-}
-
-static void handleAudioBlock(uint32_t start, uint32_t end) {
-  const bool h723ReadyNow = HAL_GPIO_ReadPin(H723_READY_IN_GPIO_Port,
-                                             H723_READY_IN_Pin) == GPIO_PIN_SET;
-
-  // If H723 restarts while F411 is running, force link re-sync from dummy mode.
-  if (!h723ReadyNow && gH723ReadyWasAsserted != 0U) {
-    gStreamLockAcquired = 0U;
-    gDummyChunksWithoutLock = 0U;
-    gRequestTxRestart = 1U;
-    rxBuffer.reset();
-    d_available = 0;
-  }
-
-  if (gStreamLockAcquired == 0U && h723ReadyNow) {
-    gStreamLockAcquired = 1U;
-    gDummyChunksWithoutLock = 0U;
-  }
-
-  gH723ReadyWasAsserted = h723ReadyNow ? 1U : 0U;
-
-  if (gStreamLockAcquired == 0U) {
-    d_available = 0;
-    ++gDummyChunksWithoutLock;
-    if (gDummyChunksWithoutLock >=
-        AudioConfig::LinkSync::RetryChunksBeforeRestart) {
-      gDummyChunksWithoutLock = 0U;
-      gRequestTxRestart = 1U;
-    }
-
-    for (uint32_t i = start; i < end; ++i) {
-      txBuffer[i] = AudioConfig::LinkSync::PatternWord;
-    }
-    return;
-  }
-
-  static std::array<int16_t, AudioConfig::HalfDMABufferSize> tempBuf;
-
-  const uint32_t numSamples{end - start};
-  rxBuffer.read(tempBuf.data(), numSamples);
-  d_available = static_cast<int32_t>(rxBuffer.getAvailableSamples());
-
-  for (uint32_t i = start, j = 0; i < end; ++i, ++j) {
-    txBuffer[i] = tempBuf[j];
-  }
 }
 void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s) {
   if (hi2s == &hi2s1) {

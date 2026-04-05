@@ -126,6 +126,8 @@ static int8_t AUDIO_GetState_FS(void);
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
 extern void rxBufferReset();
 extern void rxBufferWrite(int16_t* data, uint32_t length);
+extern void setUsbVolumeDb256(int16_t volDb256);
+extern void setUsbMuteState(uint8_t mute);
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
 /**
@@ -155,6 +157,8 @@ static int8_t AUDIO_Init_FS(uint32_t AudioFreq, uint32_t Volume, uint32_t option
 {
   /* USER CODE BEGIN 0 */
   rxBufferReset();
+  setUsbMuteState(0U);
+  setUsbVolumeDb256(USBD_AUDIO_GetCurrentVolumeDb256());
   UNUSED(AudioFreq);
   UNUSED(Volume);
   UNUSED(options);
@@ -215,6 +219,7 @@ static int8_t AUDIO_VolumeCtl_FS(uint8_t vol)
 {
   /* USER CODE BEGIN 3 */
   UNUSED(vol);
+  setUsbVolumeDb256(USBD_AUDIO_GetCurrentVolumeDb256());
   return (USBD_OK);
   /* USER CODE END 3 */
 }
@@ -227,7 +232,7 @@ static int8_t AUDIO_VolumeCtl_FS(uint8_t vol)
 static int8_t AUDIO_MuteCtl_FS(uint8_t cmd)
 {
   /* USER CODE BEGIN 4 */
-  UNUSED(cmd);
+  setUsbMuteState(cmd);
   return (USBD_OK);
   /* USER CODE END 4 */
 }

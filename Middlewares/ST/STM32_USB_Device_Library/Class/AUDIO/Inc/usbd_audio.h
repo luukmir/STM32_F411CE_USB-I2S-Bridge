@@ -94,6 +94,7 @@ extern "C" {
 #define AUDIO_STREAMING_INTERFACE_DESC_SIZE           0x07U
 
 #define AUDIO_CONTROL_MUTE                            0x0001U
+#define AUDIO_CONTROL_VOLUME                          0x0002U
 
 #define AUDIO_FORMAT_TYPE_I                           0x01U
 #define AUDIO_FORMAT_TYPE_III                         0x03U
@@ -101,6 +102,9 @@ extern "C" {
 #define AUDIO_ENDPOINT_GENERAL                        0x01U
 
 #define AUDIO_REQ_GET_CUR                             0x81U
+#define AUDIO_REQ_GET_MIN                             0x82U
+#define AUDIO_REQ_GET_MAX                             0x83U
+#define AUDIO_REQ_GET_RES                             0x84U
 #define AUDIO_REQ_SET_CUR                             0x01U
 
 #define AUDIO_OUT_STREAMING_CTRL                      0x02U
@@ -149,6 +153,7 @@ typedef struct
   uint8_t data[USB_MAX_EP0_SIZE];
   uint8_t len;
   uint8_t unit;
+  uint8_t cs;
 } USBD_AUDIO_ControlTypeDef;
 
 
@@ -322,6 +327,7 @@ uint8_t USBD_AUDIO_RegisterInterface(USBD_HandleTypeDef *pdev,
                                      USBD_AUDIO_ItfTypeDef *fops);
 
 void USBD_AUDIO_Sync(USBD_HandleTypeDef *pdev, AUDIO_OffsetTypeDef offset);
+int16_t USBD_AUDIO_GetCurrentVolumeDb256(void);
 
 #ifdef USE_USBD_COMPOSITE
 uint32_t USBD_AUDIO_GetEpPcktSze(USBD_HandleTypeDef *pdev, uint8_t If, uint8_t Ep);
