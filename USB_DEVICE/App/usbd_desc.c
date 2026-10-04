@@ -66,7 +66,7 @@
 #define USBD_LANGID_STRING     1033
 #define USBD_MANUFACTURER_STRING     "STMicroelectronics"
 #define USBD_PID_FS     22336
-#define USBD_PRODUCT_STRING_FS     "STM32 Audio Class"
+#define USBD_PRODUCT_STRING_FS     "MXC-03"
 #define USBD_CONFIGURATION_STRING_FS     "AUDIO Config"
 #define USBD_INTERFACE_STRING_FS     "AUDIO Interface"
 
@@ -442,4 +442,3 @@ static void IntToUnicode(uint32_t value, uint8_t * pbuf, uint8_t len)
 /**
   * @}
   */
-

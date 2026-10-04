@@ -50,21 +50,23 @@ public:
     if (!isReady_) {
       if (available >= (Size / 2)) {
         isReady_ = true;
+      } else {
+        std::memset(output, 0, length * sizeof(T));
+        return;
       }
     }
 
-    if (isReady_) {
-      if (available >= length) {
-        for (size_t i = 0; i < length; ++i) {
-          output[i] = data_[(current_read + i) & (Size - 1)];
-        }
-        pRead_.store(current_read + length, std::memory_order_release);
-      } else {
-        std::memset(output, 0, length * sizeof(T));
-        isReady_ = false;
+    if (available >= length) {
+      for (size_t i = 0; i < length; ++i) {
+        output[i] = data_[(current_read + i) & (Size - 1)];
       }
+      pRead_.store(current_read + length, std::memory_order_release);
     } else {
-      std::memset(output, 0, length * sizeof(T));
+      for (size_t i = 0; i < available; ++i) {
+        output[i] = data_[(current_read + i) & (Size - 1)];
+      }
+      std::memset(&output[available], 0, (length - available) * sizeof(T));
+      pRead_.store(current_write, std::memory_order_release);
     }
   }
 

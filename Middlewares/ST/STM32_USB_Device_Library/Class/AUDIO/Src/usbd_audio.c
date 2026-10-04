@@ -113,6 +113,45 @@ extern TIM_HandleTypeDef htim2;
 /** @defgroup USBD_AUDIO_Private_FunctionPrototypes
   * @{
   */
+#define AUDIO_FB_TARGET_FRAMES               ((int32_t)512)
+#define AUDIO_FB_UPDATE_INTERVAL_PACKETS     ((uint16_t)2U)
+#define AUDIO_FB_DEADBAND_FRAMES             ((int32_t)8)
+#define AUDIO_FB_KP_NUM                       ((int32_t)3)
+#define AUDIO_FB_KP_DEN                       ((int32_t)2)
+#define AUDIO_FB_KI_NUM                       ((int32_t)1)
+#define AUDIO_FB_KI_DEN                       ((int32_t)64)
+#define AUDIO_FB_I_LIMIT_HZ                   ((int32_t)300)
+#define AUDIO_FB_MAX_DEVIATION_HZ            ((int32_t)600)
+#define AUDIO_FB_UNDERRUN_GUARD_FRAMES       ((int32_t)128)
+
+typedef struct {
+  int32_t target_frames;
+  int32_t deadband;
+  int32_t kp_num;
+  int32_t kp_den;
+  int32_t ki_num;
+  int32_t ki_den;
+  int32_t i_limit_hz;
+  int32_t max_dev_hz;
+  int32_t underrun_guard;
+  int32_t nominal_freq;
+  int32_t integral_hz;
+} AudioFeedbackController_t;
+
+static AudioFeedbackController_t g_audio_fb = {
+  .target_frames   = AUDIO_FB_TARGET_FRAMES,
+  .deadband        = AUDIO_FB_DEADBAND_FRAMES,
+  .kp_num          = AUDIO_FB_KP_NUM,
+  .kp_den          = AUDIO_FB_KP_DEN,
+  .ki_num          = AUDIO_FB_KI_NUM,
+  .ki_den          = AUDIO_FB_KI_DEN,
+  .i_limit_hz      = AUDIO_FB_I_LIMIT_HZ,
+  .max_dev_hz      = AUDIO_FB_MAX_DEVIATION_HZ,
+  .underrun_guard  = AUDIO_FB_UNDERRUN_GUARD_FRAMES,
+  .nominal_freq    = (int32_t)USBD_AUDIO_FREQ,
+  .integral_hz     = 0,
+};
+
 static uint8_t USBD_AUDIO_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx);
 static uint8_t USBD_AUDIO_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx);
 
@@ -135,9 +174,9 @@ static void AUDIO_REQ_GetMin(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req
 static void AUDIO_REQ_GetMax(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
 static void AUDIO_REQ_GetRes(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
 static void AUDIO_REQ_SetCurrent(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
-static uint32_t AUDIO_ComputeFeedbackFs(int32_t available_frames);
+static uint32_t AUDIO_ComputeFeedbackFs(AudioFeedbackController_t *fb, int32_t available_frames);
 static void AUDIO_UpdateFeedbackRate(USBD_AUDIO_HandleTypeDef *haudio);
-static int32_t AUDIO_ApplyDeadband(int32_t frame_error);
+static int32_t AUDIO_ApplyDeadband(int32_t frame_error, int32_t deadband);
 static void *USBD_AUDIO_GetAudioHeaderDesc(uint8_t *pConfDesc);
 
 /**
@@ -167,7 +206,6 @@ static void *USBD_AUDIO_GetAudioHeaderDesc(uint8_t *pConfDesc);
 
 static uint8_t audio_cur_mute = 0U;
 static int16_t audio_cur_volume_db_256 = 0;
-static int32_t audio_fb_integral_hz = 0;
 
 USBD_ClassTypeDef USBD_AUDIO =
 {
@@ -384,74 +422,55 @@ __ALIGN_BEGIN static uint8_t USBD_AUDIO_DeviceQualifierDesc[USB_LEN_DEV_QUALIFIE
 static uint8_t AUDIOOutEpAdd = AUDIO_OUT_EP;
 static uint8_t AUDIOInEpAdd = AUDIO_IN_EP;
 
-static int32_t AUDIO_ApplyDeadband(int32_t frame_error)
+static inline int32_t AUDIO_ApplyDeadband(int32_t frame_error, int32_t deadband)
 {
-  if (frame_error > AUDIO_FB_DEADBAND_FRAMES)
-  {
-    return frame_error - AUDIO_FB_DEADBAND_FRAMES;
+  if (frame_error > deadband) {
+    return frame_error - deadband;
   }
-
-  if (frame_error < -AUDIO_FB_DEADBAND_FRAMES)
-  {
-    return frame_error + AUDIO_FB_DEADBAND_FRAMES;
+  if (frame_error < -deadband) {
+    return frame_error + deadband;
   }
-
   return 0;
 }
 
-static uint32_t AUDIO_ComputeFeedbackFs(int32_t available_frames)
+static uint32_t AUDIO_ComputeFeedbackFs(AudioFeedbackController_t *fb, int32_t available_frames)
 {
-  const int32_t frame_error =
-      AUDIO_ApplyDeadband(available_frames - AUDIO_FB_TARGET_FRAMES);
-  const int32_t p_correction_hz = (frame_error * AUDIO_FB_KP_NUM) / AUDIO_FB_KP_DEN;
-  const int32_t i_step_hz = (frame_error * AUDIO_FB_KI_NUM) / AUDIO_FB_KI_DEN;
-  int32_t i_candidate_hz = audio_fb_integral_hz + i_step_hz;
-  int32_t correction_hz;
-  int32_t next_fs;
-  int32_t fs_max = (int32_t)USBD_AUDIO_FREQ + AUDIO_FB_MAX_DEVIATION_HZ;
-  int32_t fs_min = (int32_t)USBD_AUDIO_FREQ - AUDIO_FB_MAX_DEVIATION_HZ;
+  int32_t fs_max = fb->nominal_freq + fb->max_dev_hz;
+  int32_t fs_min = fb->nominal_freq - fb->max_dev_hz;
 
-  if (i_candidate_hz > AUDIO_FB_I_LIMIT_HZ)
-  {
-    i_candidate_hz = AUDIO_FB_I_LIMIT_HZ;
-  }
-  else if (i_candidate_hz < -AUDIO_FB_I_LIMIT_HZ)
-  {
-    i_candidate_hz = -AUDIO_FB_I_LIMIT_HZ;
+  if (available_frames < fb->underrun_guard) {
+    fb->integral_hz = 0;
+    return (uint32_t)fs_max;
   }
 
-  correction_hz = p_correction_hz + i_candidate_hz;
-  next_fs = (int32_t)USBD_AUDIO_FREQ - correction_hz;
+  const int32_t raw_error = available_frames - fb->target_frames;
+  const int32_t frame_error = AUDIO_ApplyDeadband(raw_error, fb->deadband);
 
-  if (available_frames < AUDIO_FB_UNDERRUN_GUARD_FRAMES)
-  {
+  const int32_t p_correction_hz = (frame_error * fb->kp_num) / fb->kp_den;
+  const int32_t i_step_hz       = (frame_error * fb->ki_num) / fb->ki_den;
+
+  int32_t i_candidate_hz = fb->integral_hz + i_step_hz;
+  if (i_candidate_hz > fb->i_limit_hz) {
+    i_candidate_hz = fb->i_limit_hz;
+  } else if (i_candidate_hz < -fb->i_limit_hz) {
+    i_candidate_hz = -fb->i_limit_hz;
+  }
+
+  int32_t correction_hz = p_correction_hz + i_candidate_hz;
+  int32_t next_fs = fb->nominal_freq - correction_hz;
+
+  if (next_fs > fs_max) {
     next_fs = fs_max;
-    if (audio_fb_integral_hz > 0)
-    {
-      audio_fb_integral_hz = 0;
+    if (i_step_hz >= 0) {
+      fb->integral_hz = i_candidate_hz;
     }
-    return (uint32_t)next_fs;
-  }
-
-  if (next_fs > fs_max)
-  {
-    next_fs = fs_max;
-    if (i_step_hz >= 0)
-    {
-      audio_fb_integral_hz = i_candidate_hz;
-    }
-  }
-  else if (next_fs < fs_min)
-  {
+  } else if (next_fs < fs_min) {
     next_fs = fs_min;
-    if (i_step_hz <= 0)
-    {
-      audio_fb_integral_hz = i_candidate_hz;
+    if (i_step_hz <= 0) {
+      fb->integral_hz = i_candidate_hz;
     }
-  }
-  else
-  {
-    audio_fb_integral_hz = i_candidate_hz;
+  } else {
+    fb->integral_hz = i_candidate_hz;
   }
 
   return (uint32_t)next_fs;
@@ -460,7 +479,7 @@ static uint32_t AUDIO_ComputeFeedbackFs(int32_t available_frames)
 static void AUDIO_UpdateFeedbackRate(USBD_AUDIO_HandleTypeDef *haudio)
 {
   int32_t available_frames = rxBufferGetAvailableFrames();
-  haudio->iso_cont.fs = AUDIO_ComputeFeedbackFs(available_frames);
+  haudio->iso_cont.fs = AUDIO_ComputeFeedbackFs(&g_audio_fb, available_frames);
 }
 /**
   * @}
@@ -535,7 +554,8 @@ static uint8_t USBD_AUDIO_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   haudio->iso_cont.usbintn = 0U;
   haudio->iso_cont.tx_flag = 1U;
   haudio->iso_cont.ofs_packet = 0;
-  audio_fb_integral_hz = 0;
+
+  g_audio_fb.integral_hz = 0;
   /* USER CODE END */
 
   /* Initialize the Audio output Hardware layer */
@@ -894,9 +914,10 @@ static uint8_t USBD_AUDIO_SOF(USBD_HandleTypeDef *pdev) {
       ep->DIEPCTL |= USB_OTG_DIEPCTL_SODDFRM;
     }
 
-    fb_data.rate = ((haudio->iso_cont.fs / 1000U) << 14) |
-                   ((haudio->iso_cont.fs % 1000U) << 4);
-    fb_data.fbbuf[3] = 0x00;
+    uint32_t integer_part = haudio->iso_cont.fs / 1000U;
+		uint32_t fractional_part = ((haudio->iso_cont.fs % 1000U) << 14) / 1000U;
+		fb_data.rate = (integer_part << 14) | (fractional_part & 0x3FFFU);
+		fb_data.fbbuf[3] = 0x00;
 
     if (USBD_LL_Transmit(pdev, AUDIOInEpAdd, (uint8_t *)fb_data.fbbuf, 3U) ==
         USBD_OK) {
@@ -1086,7 +1107,7 @@ static uint8_t USBD_AUDIO_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum) {
 
         /* USER CODE BEGIN */
         haudio->iso_cont.tx_flag = 0U;
-        audio_fb_integral_hz = 0;
+        g_audio_fb.integral_hz = 0;
         /* USER CODE END */
       }
     }
