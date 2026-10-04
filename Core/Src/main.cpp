@@ -67,6 +67,11 @@ constexpr uint32_t RetryChunksBeforeRestart{32};
 } // namespace LinkSync
 } // namespace AudioConfig
 
+volatile uint32_t g_debug_samples_in = 0;
+volatile uint32_t g_debug_samples_out = 0;
+volatile uint32_t g_debug_dma_half_callbacks = 0;
+volatile uint32_t g_debug_dma_full_callbacks = 0;
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -221,6 +226,7 @@ static void renderUsbAudioBlock(uint32_t start, uint32_t end) {
 
   const uint32_t numSamples{end - start};
   rxBuffer.read(tempBuf.data(), numSamples);
+  g_debug_samples_out += numSamples;
   d_available = static_cast<int32_t>(rxBuffer.getAvailableSamples());
 
   const uint32_t gainQ15 = (gUsbMute != 0U) ? 0U : gUsbGainQ15;
@@ -561,15 +567,18 @@ void rxBufferWrite(int16_t *data, uint32_t length) {
   }
 
   rxBuffer.write(data, length);
+  g_debug_samples_in += length;
   d_available = static_cast<int32_t>(rxBuffer.getAvailableSamples());
 }
 void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s) {
   if (hi2s == &hi2s1) {
+    ++g_debug_dma_half_callbacks;
     handleAudioBlock(0, AudioConfig::HalfDMABufferSize);
   }
 }
 void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s) {
   if (hi2s == &hi2s1) {
+    ++g_debug_dma_full_callbacks;
     handleAudioBlock(AudioConfig::HalfDMABufferSize,
                      AudioConfig::DMABufferSize);
   }

@@ -62,11 +62,9 @@ public:
       }
       pRead_.store(current_read + length, std::memory_order_release);
     } else {
-      for (size_t i = 0; i < available; ++i) {
-        output[i] = data_[(current_read + i) & (Size - 1)];
-      }
-      std::memset(&output[available], 0, (length - available) * sizeof(T));
-      pRead_.store(current_write, std::memory_order_release);
+    	std::memset(output, 0, length * sizeof(T));
+			pRead_.store(current_write, std::memory_order_release);
+			isReady_ = false;
     }
   }
 

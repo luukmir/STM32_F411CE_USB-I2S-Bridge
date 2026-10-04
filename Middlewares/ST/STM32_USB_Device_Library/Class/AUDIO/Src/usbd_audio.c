@@ -127,12 +127,17 @@ extern int32_t rxBufferGetAvailableFrames(void);
 #define AUDIO_FB_UNDERRUN_GUARD_FRAMES       ((int32_t)128)
 
 typedef struct {
-  uint16_t timer_diff;      // 1msあたりのカウント（47〜49）
+  uint16_t timer_diff;      // 前回測定からのエッジ数
+  uint32_t measure_elapsed_ms; // 前回測定からの実測時間
   uint32_t raw_fb_q14;      // フィルタ後のQ14値
   int32_t  buf_error;       // バッファ残量偏差
   int32_t  trim_q14;        // 微小トリム値（-8〜+8）
   uint32_t final_fb_q14;    // 最終送信値（fb_data.rate）
   uint32_t measured_hz;     // 計算上の推定実測Hz
+  uint32_t pkt_cnt_192; // 通常 (48サンプル)
+  uint32_t pkt_cnt_196;// 増加 (49サンプル)
+  uint32_t pkt_cnt_188; // 減少 (47サンプル)
+  uint16_t last_pkt_size;
 } AudioFeedbackDebug_t;
 
 volatile AudioFeedbackDebug_t g_fb_debug;
@@ -164,6 +169,87 @@ static AudioFeedbackController_t g_audio_fb = {
   .nominal_freq    = (int32_t)USBD_AUDIO_FREQ,
   .integral_hz     = 0,
 };
+
+extern uint32_t g_debug_samples_in;   // 1秒間の供給サンプル数
+extern uint32_t g_debug_samples_out;  // 1秒間の消費サンプル数
+extern uint32_t g_debug_dma_half_callbacks;
+extern uint32_t g_debug_dma_full_callbacks;
+volatile uint32_t g_dbg_delta_in = 0;   // 1秒間の供給サンプル数
+volatile uint32_t g_dbg_delta_out = 0;  // 1秒間の消費サンプル数
+volatile uint32_t g_debug_window_elapsed_ms = 0;
+volatile uint32_t g_debug_window_timer_edges = 0;
+volatile uint32_t g_debug_window_input_samples = 0;
+volatile uint32_t g_debug_window_output_samples = 0;
+volatile uint32_t g_debug_window_output_frames = 0;
+volatile uint32_t g_debug_window_dma_half_callbacks = 0;
+volatile uint32_t g_debug_window_dma_full_callbacks = 0;
+volatile uint32_t g_debug_window_sof_callbacks = 0;
+volatile uint32_t g_debug_window_feedback_packets = 0;
+volatile uint32_t g_debug_window_packet_bytes = 0;
+
+volatile uint32_t g_debug_sof_callbacks = 0;
+volatile uint32_t g_debug_feedback_packets = 0;
+volatile uint32_t g_debug_packet_bytes = 0;
+
+void CheckRateDelta_1s(void)
+{
+  static uint32_t last_time = 0;
+  static uint32_t last_in = 0;
+  static uint32_t last_out = 0;
+  static uint32_t last_dma_half = 0;
+  static uint32_t last_dma_full = 0;
+  static uint32_t last_sof = 0;
+  static uint32_t last_feedback = 0;
+  static uint32_t last_packet_bytes = 0;
+  static uint16_t last_timer_count = 0;
+  static uint8_t initialized = 0;
+
+  uint32_t now = HAL_GetTick();
+  ++g_debug_sof_callbacks;
+
+  if (initialized == 0U) {
+    last_time = now;
+    last_in = g_debug_samples_in;
+    last_out = g_debug_samples_out;
+    last_dma_half = g_debug_dma_half_callbacks;
+    last_dma_full = g_debug_dma_full_callbacks;
+    last_sof = g_debug_sof_callbacks;
+    last_feedback = g_debug_feedback_packets;
+    last_packet_bytes = g_debug_packet_bytes;
+    last_timer_count = (uint16_t)htim3.Instance->CNT;
+    initialized = 1U;
+    return;
+  }
+
+  if (now - last_time >= 1000U) {
+    const uint32_t elapsed_ms = now - last_time;
+    const uint16_t current_timer_count = (uint16_t)htim3.Instance->CNT;
+
+    last_time = now;
+    g_debug_window_elapsed_ms = elapsed_ms;
+    g_debug_window_timer_edges = (uint16_t)(current_timer_count - last_timer_count);
+    g_debug_window_input_samples = g_debug_samples_in - last_in;
+    g_debug_window_output_samples = g_debug_samples_out - last_out;
+    g_debug_window_output_frames = g_debug_window_output_samples / 2U;
+    g_debug_window_dma_half_callbacks = g_debug_dma_half_callbacks - last_dma_half;
+    g_debug_window_dma_full_callbacks = g_debug_dma_full_callbacks - last_dma_full;
+    g_debug_window_sof_callbacks = g_debug_sof_callbacks - last_sof;
+    g_debug_window_feedback_packets = g_debug_feedback_packets - last_feedback;
+    g_debug_window_packet_bytes = g_debug_packet_bytes - last_packet_bytes;
+
+    g_dbg_delta_in = g_debug_window_input_samples;
+    g_dbg_delta_out = g_debug_window_output_samples;
+
+    last_in  = g_debug_samples_in;
+    last_out = g_debug_samples_out;
+    last_dma_half = g_debug_dma_half_callbacks;
+    last_dma_full = g_debug_dma_full_callbacks;
+    last_sof = g_debug_sof_callbacks;
+    last_feedback = g_debug_feedback_packets;
+    last_packet_bytes = g_debug_packet_bytes;
+    last_timer_count = current_timer_count;
+  }
+}
 
 static uint8_t USBD_AUDIO_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx);
 static uint8_t USBD_AUDIO_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx);
@@ -498,54 +584,68 @@ static void AUDIO_UpdateFeedbackRate(USBD_AUDIO_HandleTypeDef *haudio)
 static uint32_t Audio_MeasureHardwareFeedbackRate(void)
 {
   static uint16_t last_cnt = 0U;
+  static uint32_t last_measure_time = 0U;
   static uint32_t filtered_diff_q14 = (48U << 14); // 初期値 48.0 (Q14)
+  static int32_t trim_q14_state = 0;
   static uint8_t init_done = 0U;
 
+  const uint32_t measurement_window_ms = 32U;
+
   uint16_t current_cnt = (uint16_t)(htim3.Instance->CNT);
+  uint32_t current_time = HAL_GetTick();
 
   if (init_done == 0U) {
     last_cnt = current_cnt;
+    last_measure_time = current_time;
     init_done = 1U;
     return (48U << 14);
   }
 
-  // 16bitタイマのオーバーフローを考慮した1ms差分（約48進む）
-  uint16_t diff = current_cnt - last_cnt;
-  last_cnt = current_cnt;
+  // 短時間ではエッジ数の量子化誤差が大きいため、一定時間積算する。
+  uint16_t diff = (uint16_t)(current_cnt - last_cnt);
+  uint32_t elapsed_ms = current_time - last_measure_time;
 
-  // 異常値ガード（切断時やノイズ対策）
-  if (diff < 40U || diff > 56U) {
-    diff = 48U;
+  if (elapsed_ms >= measurement_window_ms) {
+    // UAC feedbackの単位はHzではなく、1 USBフレームあたりのサンプル数。
+    // 48 kHzでは約48.0 << 14となるよう、実測エッジ数/経過msをQ14化する。
+    uint32_t measured_rate_q14 =
+        ((uint32_t)diff << 14) / elapsed_ms;
+    filtered_diff_q14 =
+        ((filtered_diff_q14 * 31U) + measured_rate_q14) >> 5;
+    last_cnt = current_cnt;
+    last_measure_time = current_time;
   }
-
-  // IIR平滑化フィルタ: y[n] = (31 * y[n-1] + x[n]) / 32
-  filtered_diff_q14 = ((filtered_diff_q14 * 31U) + ((uint32_t)diff << 14)) >> 5;
 
   /* --- バッファ残量による極微小トリム (音程に影響しない ±0.5 Hz 以内) --- */
   int32_t available = rxBufferGetAvailableFrames();
-	int32_t buf_error = available - FB_TARGET_FRAMES; // 512からのズレ
+	int32_t buf_error = available - FB_TARGET_FRAMES; // 512からの偏差
 
 	int32_t trim_q14 = 0;
 
-	// 1. 目標から大きく外れている場合（起動直後や一時的な途切れ時）
+	// 1. 大きく外れているとき（素早く中央へ引き戻す）
 	if (buf_error < -32 || buf_error > 32) {
-		// 粗いP制御: 素早く512へ引き戻す (最大 ±50 Hz 程度)
-		trim_q14 = -(buf_error * 16);
-		if (trim_q14 > 800)  trim_q14 = 800;   // 約 +49 Hz (PCに多く送らせる)
-		if (trim_q14 < -800) trim_q14 = -800;  // 約 -49 Hz (PCに少なく送らせる)
+    // バッファを引き戻すため、補正を最大約 ±250 Hzまで許容する。
+		trim_q14 = -(buf_error * 24);
+    if (trim_q14 > 4096)  trim_q14 = 4096;
+    if (trim_q14 < -4096) trim_q14 = -4096;
 	}
-	// 2. 目標近傍（512 ± 32）に収まっている定常時
+	// 2. 目標近傍（512 ± 32）に収まった定常時
 	else {
-		// 超微小トリム: 耳で絶対に知覚できない ±0.5 Hz 以内に固定
-		trim_q14 = -(buf_error * 16) / 256;
-		if (trim_q14 > 8)  trim_q14 = 8;
-		if (trim_q14 < -8) trim_q14 = -8;
+		// 中央に入ったら音程変化を避けるため ±1.0 Hz 以内の微小トリムへ移行
+		trim_q14 = -(buf_error * 16) / 128; // 最大 ±1.0 Hz (Q14で約 ±16)
+		if (trim_q14 > 16)  trim_q14 = 16;
+		if (trim_q14 < -16) trim_q14 = -16;
 	}
+
+  // バッファ偏差が閾値を跨いだときのfeedback急変を抑える。
+  trim_q14_state = (trim_q14_state * 7 + trim_q14) / 8;
+  trim_q14 = trim_q14_state;
 
 	int32_t final_fb_q14 = (int32_t)filtered_diff_q14 + trim_q14;
 
   /* デバッグ用構造体への代入 */
   g_fb_debug.timer_diff   = diff;
+  g_fb_debug.measure_elapsed_ms = elapsed_ms;
   g_fb_debug.raw_fb_q14   = filtered_diff_q14;
   g_fb_debug.measured_hz  = (filtered_diff_q14 * 1000U) >> 14;
   g_fb_debug.buf_error    = buf_error;
@@ -993,8 +1093,12 @@ static uint8_t USBD_AUDIO_SOF(USBD_HandleTypeDef *pdev) {
     if (USBD_LL_Transmit(pdev, AUDIOInEpAdd, (uint8_t *)fb_data.fbbuf, 3U) ==
         USBD_OK) {
       haudio->iso_cont.tx_flag = 1U;
+      ++g_debug_feedback_packets;
     }
   }
+
+  CheckRateDelta_1s();
+
   /* USER CODE END */
 
   return (uint8_t)USBD_OK;
@@ -1149,6 +1253,17 @@ static uint8_t USBD_AUDIO_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum) {
 
   if (epnum == (AUDIOOutEpAdd & 0xFU)) {
     PacketSize = (uint16_t)USBD_LL_GetRxDataSize(pdev, epnum);
+    g_debug_packet_bytes += PacketSize;
+
+		/* USER CODE BEGIN: パケットサイズ監視用 */
+		g_fb_debug.last_pkt_size = PacketSize;
+		if (PacketSize == 192) {
+			g_fb_debug.pkt_cnt_192++;
+		} else if (PacketSize == 196) {
+			g_fb_debug.pkt_cnt_196++; // これが増えればホストが加速要求に反応している！
+		} else if (PacketSize == 188) {
+			g_fb_debug.pkt_cnt_188++;
+		}
 
     /* USER CODE BEGIN */
     haudio->iso_cont.ofs_packet = (haudio->iso_cont.ofs_packet + PacketSize) % AUDIO_TOTAL_BUF_SIZE;
