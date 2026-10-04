@@ -63,10 +63,11 @@ EndBSPDependencies */
 #include "usbd_audio.h"
 #include "usbd_ctlreq.h"
 
-extern int32_t rxBufferGetAvailableFrames(void);
-
 extern DMA_HandleTypeDef hdma_tim2_ch1;
 extern TIM_HandleTypeDef htim2;
+extern TIM_HandleTypeDef htim3;
+
+extern int32_t rxBufferGetAvailableFrames(void);
 /** @addtogroup STM32_USB_DEVICE_LIBRARY
   * @{
   */
@@ -91,7 +92,8 @@ extern TIM_HandleTypeDef htim2;
 /**
   * @}
   */
-
+#define FB_TARGET_FRAMES				512
+#define FB_SAMPLE_RATE_BASE			48000U
 
 /** @defgroup USBD_AUDIO_Private_Macros
   * @{
@@ -123,6 +125,17 @@ extern TIM_HandleTypeDef htim2;
 #define AUDIO_FB_I_LIMIT_HZ                   ((int32_t)300)
 #define AUDIO_FB_MAX_DEVIATION_HZ            ((int32_t)600)
 #define AUDIO_FB_UNDERRUN_GUARD_FRAMES       ((int32_t)128)
+
+typedef struct {
+  uint16_t timer_diff;      // 1msあたりのカウント（47〜49）
+  uint32_t raw_fb_q14;      // フィルタ後のQ14値
+  int32_t  buf_error;       // バッファ残量偏差
+  int32_t  trim_q14;        // 微小トリム値（-8〜+8）
+  uint32_t final_fb_q14;    // 最終送信値（fb_data.rate）
+  uint32_t measured_hz;     // 計算上の推定実測Hz
+} AudioFeedbackDebug_t;
+
+volatile AudioFeedbackDebug_t g_fb_debug;
 
 typedef struct {
   int32_t target_frames;
@@ -480,6 +493,66 @@ static void AUDIO_UpdateFeedbackRate(USBD_AUDIO_HandleTypeDef *haudio)
 {
   int32_t available_frames = rxBufferGetAvailableFrames();
   haudio->iso_cont.fs = AUDIO_ComputeFeedbackFs(&g_audio_fb, available_frames);
+}
+
+static uint32_t Audio_MeasureHardwareFeedbackRate(void)
+{
+  static uint16_t last_cnt = 0U;
+  static uint32_t filtered_diff_q14 = (48U << 14); // 初期値 48.0 (Q14)
+  static uint8_t init_done = 0U;
+
+  uint16_t current_cnt = (uint16_t)(htim3.Instance->CNT);
+
+  if (init_done == 0U) {
+    last_cnt = current_cnt;
+    init_done = 1U;
+    return (48U << 14);
+  }
+
+  // 16bitタイマのオーバーフローを考慮した1ms差分（約48進む）
+  uint16_t diff = current_cnt - last_cnt;
+  last_cnt = current_cnt;
+
+  // 異常値ガード（切断時やノイズ対策）
+  if (diff < 40U || diff > 56U) {
+    diff = 48U;
+  }
+
+  // IIR平滑化フィルタ: y[n] = (31 * y[n-1] + x[n]) / 32
+  filtered_diff_q14 = ((filtered_diff_q14 * 31U) + ((uint32_t)diff << 14)) >> 5;
+
+  /* --- バッファ残量による極微小トリム (音程に影響しない ±0.5 Hz 以内) --- */
+  int32_t available = rxBufferGetAvailableFrames();
+	int32_t buf_error = available - FB_TARGET_FRAMES; // 512からのズレ
+
+	int32_t trim_q14 = 0;
+
+	// 1. 目標から大きく外れている場合（起動直後や一時的な途切れ時）
+	if (buf_error < -32 || buf_error > 32) {
+		// 粗いP制御: 素早く512へ引き戻す (最大 ±50 Hz 程度)
+		trim_q14 = -(buf_error * 16);
+		if (trim_q14 > 800)  trim_q14 = 800;   // 約 +49 Hz (PCに多く送らせる)
+		if (trim_q14 < -800) trim_q14 = -800;  // 約 -49 Hz (PCに少なく送らせる)
+	}
+	// 2. 目標近傍（512 ± 32）に収まっている定常時
+	else {
+		// 超微小トリム: 耳で絶対に知覚できない ±0.5 Hz 以内に固定
+		trim_q14 = -(buf_error * 16) / 256;
+		if (trim_q14 > 8)  trim_q14 = 8;
+		if (trim_q14 < -8) trim_q14 = -8;
+	}
+
+	int32_t final_fb_q14 = (int32_t)filtered_diff_q14 + trim_q14;
+
+  /* デバッグ用構造体への代入 */
+  g_fb_debug.timer_diff   = diff;
+  g_fb_debug.raw_fb_q14   = filtered_diff_q14;
+  g_fb_debug.measured_hz  = (filtered_diff_q14 * 1000U) >> 14;
+  g_fb_debug.buf_error    = buf_error;
+  g_fb_debug.trim_q14     = trim_q14;
+  g_fb_debug.final_fb_q14 = (uint32_t)final_fb_q14;
+
+  return (uint32_t)final_fb_q14;
 }
 /**
   * @}
@@ -914,9 +987,7 @@ static uint8_t USBD_AUDIO_SOF(USBD_HandleTypeDef *pdev) {
       ep->DIEPCTL |= USB_OTG_DIEPCTL_SODDFRM;
     }
 
-    uint32_t integer_part = haudio->iso_cont.fs / 1000U;
-		uint32_t fractional_part = ((haudio->iso_cont.fs % 1000U) << 14) / 1000U;
-		fb_data.rate = (integer_part << 14) | (fractional_part & 0x3FFFU);
+    fb_data.rate = Audio_MeasureHardwareFeedbackRate();
 		fb_data.fbbuf[3] = 0x00;
 
     if (USBD_LL_Transmit(pdev, AUDIOInEpAdd, (uint8_t *)fb_data.fbbuf, 3U) ==
