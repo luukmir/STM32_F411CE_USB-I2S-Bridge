@@ -64,7 +64,6 @@ EndBSPDependencies */
 #include "usbd_ctlreq.h"
 
 extern DMA_HandleTypeDef hdma_tim2_ch1;
-extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
 
 extern int32_t rxBufferGetAvailableFrames(void);
@@ -93,7 +92,6 @@ extern int32_t rxBufferGetAvailableFrames(void);
   * @}
   */
 #define FB_TARGET_FRAMES				512
-#define FB_SAMPLE_RATE_BASE			48000U
 
 /** @defgroup USBD_AUDIO_Private_Macros
   * @{
@@ -104,78 +102,28 @@ extern int32_t rxBufferGetAvailableFrames(void);
 #define AUDIO_PACKET_SZE(frq) \
   (uint8_t)(((frq * 2U * 2U) / 1000U + 4U) & 0xFFU), (uint8_t)((((frq * 2U * 2U) / 1000U) >> 8) & 0xFFU)
 
-#ifdef USE_USBD_COMPOSITE
-#define AUDIO_PACKET_SZE_WORD(frq)     (uint32_t)((((frq) * 2U * 2U)/1000U))
-#endif /* USE_USBD_COMPOSITE  */
-/**
-  * @}
-  */
-
-
-/** @defgroup USBD_AUDIO_Private_FunctionPrototypes
-  * @{
-  */
-#define AUDIO_FB_TARGET_FRAMES               ((int32_t)512)
-#define AUDIO_FB_UPDATE_INTERVAL_PACKETS     ((uint16_t)2U)
-#define AUDIO_FB_DEADBAND_FRAMES             ((int32_t)8)
-#define AUDIO_FB_KP_NUM                       ((int32_t)3)
-#define AUDIO_FB_KP_DEN                       ((int32_t)2)
-#define AUDIO_FB_KI_NUM                       ((int32_t)1)
-#define AUDIO_FB_KI_DEN                       ((int32_t)64)
-#define AUDIO_FB_I_LIMIT_HZ                   ((int32_t)300)
-#define AUDIO_FB_MAX_DEVIATION_HZ            ((int32_t)600)
-#define AUDIO_FB_UNDERRUN_GUARD_FRAMES       ((int32_t)128)
+extern uint32_t g_debug_samples_in;
+extern uint32_t g_debug_samples_out;
+extern uint32_t g_debug_dma_half_callbacks;
+extern uint32_t g_debug_dma_full_callbacks;
 
 typedef struct {
-  uint16_t timer_diff;      // 前回測定からのエッジ数
-  uint32_t measure_elapsed_ms; // 前回測定からの実測時間
-  uint32_t raw_fb_q14;      // フィルタ後のQ14値
-  int32_t  buf_error;       // バッファ残量偏差
-  int32_t  trim_q14;        // 微小トリム値（-8〜+8）
-  uint32_t final_fb_q14;    // 最終送信値（fb_data.rate）
-  uint32_t measured_hz;     // 計算上の推定実測Hz
-  uint32_t pkt_cnt_192; // 通常 (48サンプル)
-  uint32_t pkt_cnt_196;// 増加 (49サンプル)
-  uint32_t pkt_cnt_188; // 減少 (47サンプル)
+  uint16_t timer_diff;
+  uint32_t measure_elapsed_ms;
+  uint32_t raw_fb_q14;
+  int32_t buf_error;
+  int32_t trim_q14;
+  uint32_t final_fb_q14;
+  uint32_t measured_hz;
+  uint32_t pkt_cnt_192;
+  uint32_t pkt_cnt_196;
+  uint32_t pkt_cnt_188;
   uint16_t last_pkt_size;
 } AudioFeedbackDebug_t;
 
 volatile AudioFeedbackDebug_t g_fb_debug;
-
-typedef struct {
-  int32_t target_frames;
-  int32_t deadband;
-  int32_t kp_num;
-  int32_t kp_den;
-  int32_t ki_num;
-  int32_t ki_den;
-  int32_t i_limit_hz;
-  int32_t max_dev_hz;
-  int32_t underrun_guard;
-  int32_t nominal_freq;
-  int32_t integral_hz;
-} AudioFeedbackController_t;
-
-static AudioFeedbackController_t g_audio_fb = {
-  .target_frames   = AUDIO_FB_TARGET_FRAMES,
-  .deadband        = AUDIO_FB_DEADBAND_FRAMES,
-  .kp_num          = AUDIO_FB_KP_NUM,
-  .kp_den          = AUDIO_FB_KP_DEN,
-  .ki_num          = AUDIO_FB_KI_NUM,
-  .ki_den          = AUDIO_FB_KI_DEN,
-  .i_limit_hz      = AUDIO_FB_I_LIMIT_HZ,
-  .max_dev_hz      = AUDIO_FB_MAX_DEVIATION_HZ,
-  .underrun_guard  = AUDIO_FB_UNDERRUN_GUARD_FRAMES,
-  .nominal_freq    = (int32_t)USBD_AUDIO_FREQ,
-  .integral_hz     = 0,
-};
-
-extern uint32_t g_debug_samples_in;   // 1秒間の供給サンプル数
-extern uint32_t g_debug_samples_out;  // 1秒間の消費サンプル数
-extern uint32_t g_debug_dma_half_callbacks;
-extern uint32_t g_debug_dma_full_callbacks;
-volatile uint32_t g_dbg_delta_in = 0;   // 1秒間の供給サンプル数
-volatile uint32_t g_dbg_delta_out = 0;  // 1秒間の消費サンプル数
+volatile uint32_t g_dbg_delta_in = 0;
+volatile uint32_t g_dbg_delta_out = 0;
 volatile uint32_t g_debug_window_elapsed_ms = 0;
 volatile uint32_t g_debug_window_timer_edges = 0;
 volatile uint32_t g_debug_window_input_samples = 0;
@@ -186,70 +134,17 @@ volatile uint32_t g_debug_window_dma_full_callbacks = 0;
 volatile uint32_t g_debug_window_sof_callbacks = 0;
 volatile uint32_t g_debug_window_feedback_packets = 0;
 volatile uint32_t g_debug_window_packet_bytes = 0;
-
 volatile uint32_t g_debug_sof_callbacks = 0;
 volatile uint32_t g_debug_feedback_packets = 0;
 volatile uint32_t g_debug_packet_bytes = 0;
 
-void CheckRateDelta_1s(void)
-{
-  static uint32_t last_time = 0;
-  static uint32_t last_in = 0;
-  static uint32_t last_out = 0;
-  static uint32_t last_dma_half = 0;
-  static uint32_t last_dma_full = 0;
-  static uint32_t last_sof = 0;
-  static uint32_t last_feedback = 0;
-  static uint32_t last_packet_bytes = 0;
-  static uint16_t last_timer_count = 0;
-  static uint8_t initialized = 0;
+#ifdef USE_USBD_COMPOSITE
+#define AUDIO_PACKET_SZE_WORD(frq)     (uint32_t)((((frq) * 2U * 2U)/1000U))
+#endif /* USE_USBD_COMPOSITE  */
+/**
+  * @}
+  */
 
-  uint32_t now = HAL_GetTick();
-  ++g_debug_sof_callbacks;
-
-  if (initialized == 0U) {
-    last_time = now;
-    last_in = g_debug_samples_in;
-    last_out = g_debug_samples_out;
-    last_dma_half = g_debug_dma_half_callbacks;
-    last_dma_full = g_debug_dma_full_callbacks;
-    last_sof = g_debug_sof_callbacks;
-    last_feedback = g_debug_feedback_packets;
-    last_packet_bytes = g_debug_packet_bytes;
-    last_timer_count = (uint16_t)htim3.Instance->CNT;
-    initialized = 1U;
-    return;
-  }
-
-  if (now - last_time >= 1000U) {
-    const uint32_t elapsed_ms = now - last_time;
-    const uint16_t current_timer_count = (uint16_t)htim3.Instance->CNT;
-
-    last_time = now;
-    g_debug_window_elapsed_ms = elapsed_ms;
-    g_debug_window_timer_edges = (uint16_t)(current_timer_count - last_timer_count);
-    g_debug_window_input_samples = g_debug_samples_in - last_in;
-    g_debug_window_output_samples = g_debug_samples_out - last_out;
-    g_debug_window_output_frames = g_debug_window_output_samples / 2U;
-    g_debug_window_dma_half_callbacks = g_debug_dma_half_callbacks - last_dma_half;
-    g_debug_window_dma_full_callbacks = g_debug_dma_full_callbacks - last_dma_full;
-    g_debug_window_sof_callbacks = g_debug_sof_callbacks - last_sof;
-    g_debug_window_feedback_packets = g_debug_feedback_packets - last_feedback;
-    g_debug_window_packet_bytes = g_debug_packet_bytes - last_packet_bytes;
-
-    g_dbg_delta_in = g_debug_window_input_samples;
-    g_dbg_delta_out = g_debug_window_output_samples;
-
-    last_in  = g_debug_samples_in;
-    last_out = g_debug_samples_out;
-    last_dma_half = g_debug_dma_half_callbacks;
-    last_dma_full = g_debug_dma_full_callbacks;
-    last_sof = g_debug_sof_callbacks;
-    last_feedback = g_debug_feedback_packets;
-    last_packet_bytes = g_debug_packet_bytes;
-    last_timer_count = current_timer_count;
-  }
-}
 
 static uint8_t USBD_AUDIO_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx);
 static uint8_t USBD_AUDIO_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx);
@@ -273,9 +168,6 @@ static void AUDIO_REQ_GetMin(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req
 static void AUDIO_REQ_GetMax(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
 static void AUDIO_REQ_GetRes(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
 static void AUDIO_REQ_SetCurrent(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
-static uint32_t AUDIO_ComputeFeedbackFs(AudioFeedbackController_t *fb, int32_t available_frames);
-static void AUDIO_UpdateFeedbackRate(USBD_AUDIO_HandleTypeDef *haudio);
-static int32_t AUDIO_ApplyDeadband(int32_t frame_error, int32_t deadband);
 static void *USBD_AUDIO_GetAudioHeaderDesc(uint8_t *pConfDesc);
 
 /**
@@ -292,17 +184,6 @@ static void *USBD_AUDIO_GetAudioHeaderDesc(uint8_t *pConfDesc);
 #define AUDIO_VOLUME_RES_DB_256 ((int16_t)128)
 
 /* Async feedback loop tuning for host compatibility and underrun resilience. */
-#define AUDIO_FB_TARGET_FRAMES               ((int32_t)512)
-#define AUDIO_FB_UPDATE_INTERVAL_PACKETS     ((uint16_t)2U)
-#define AUDIO_FB_DEADBAND_FRAMES             ((int32_t)8)
-#define AUDIO_FB_KP_NUM                       ((int32_t)3)
-#define AUDIO_FB_KP_DEN                       ((int32_t)2)
-#define AUDIO_FB_KI_NUM                       ((int32_t)1)
-#define AUDIO_FB_KI_DEN                       ((int32_t)64)
-#define AUDIO_FB_I_LIMIT_HZ                   ((int32_t)300)
-#define AUDIO_FB_MAX_DEVIATION_HZ            ((int32_t)600)
-#define AUDIO_FB_UNDERRUN_GUARD_FRAMES       ((int32_t)128)
-
 static uint8_t audio_cur_mute = 0U;
 static int16_t audio_cur_volume_db_256 = 0;
 
@@ -521,66 +402,6 @@ __ALIGN_BEGIN static uint8_t USBD_AUDIO_DeviceQualifierDesc[USB_LEN_DEV_QUALIFIE
 static uint8_t AUDIOOutEpAdd = AUDIO_OUT_EP;
 static uint8_t AUDIOInEpAdd = AUDIO_IN_EP;
 
-static inline int32_t AUDIO_ApplyDeadband(int32_t frame_error, int32_t deadband)
-{
-  if (frame_error > deadband) {
-    return frame_error - deadband;
-  }
-  if (frame_error < -deadband) {
-    return frame_error + deadband;
-  }
-  return 0;
-}
-
-static uint32_t AUDIO_ComputeFeedbackFs(AudioFeedbackController_t *fb, int32_t available_frames)
-{
-  int32_t fs_max = fb->nominal_freq + fb->max_dev_hz;
-  int32_t fs_min = fb->nominal_freq - fb->max_dev_hz;
-
-  if (available_frames < fb->underrun_guard) {
-    fb->integral_hz = 0;
-    return (uint32_t)fs_max;
-  }
-
-  const int32_t raw_error = available_frames - fb->target_frames;
-  const int32_t frame_error = AUDIO_ApplyDeadband(raw_error, fb->deadband);
-
-  const int32_t p_correction_hz = (frame_error * fb->kp_num) / fb->kp_den;
-  const int32_t i_step_hz       = (frame_error * fb->ki_num) / fb->ki_den;
-
-  int32_t i_candidate_hz = fb->integral_hz + i_step_hz;
-  if (i_candidate_hz > fb->i_limit_hz) {
-    i_candidate_hz = fb->i_limit_hz;
-  } else if (i_candidate_hz < -fb->i_limit_hz) {
-    i_candidate_hz = -fb->i_limit_hz;
-  }
-
-  int32_t correction_hz = p_correction_hz + i_candidate_hz;
-  int32_t next_fs = fb->nominal_freq - correction_hz;
-
-  if (next_fs > fs_max) {
-    next_fs = fs_max;
-    if (i_step_hz >= 0) {
-      fb->integral_hz = i_candidate_hz;
-    }
-  } else if (next_fs < fs_min) {
-    next_fs = fs_min;
-    if (i_step_hz <= 0) {
-      fb->integral_hz = i_candidate_hz;
-    }
-  } else {
-    fb->integral_hz = i_candidate_hz;
-  }
-
-  return (uint32_t)next_fs;
-}
-
-static void AUDIO_UpdateFeedbackRate(USBD_AUDIO_HandleTypeDef *haudio)
-{
-  int32_t available_frames = rxBufferGetAvailableFrames();
-  haudio->iso_cont.fs = AUDIO_ComputeFeedbackFs(&g_audio_fb, available_frames);
-}
-
 static uint32_t Audio_MeasureHardwareFeedbackRate(void)
 {
   static uint16_t last_cnt = 0U;
@@ -643,16 +464,76 @@ static uint32_t Audio_MeasureHardwareFeedbackRate(void)
 
 	int32_t final_fb_q14 = (int32_t)filtered_diff_q14 + trim_q14;
 
-  /* デバッグ用構造体への代入 */
-  g_fb_debug.timer_diff   = diff;
+  g_fb_debug.timer_diff = diff;
   g_fb_debug.measure_elapsed_ms = elapsed_ms;
-  g_fb_debug.raw_fb_q14   = filtered_diff_q14;
-  g_fb_debug.measured_hz  = (filtered_diff_q14 * 1000U) >> 14;
-  g_fb_debug.buf_error    = buf_error;
-  g_fb_debug.trim_q14     = trim_q14;
+  g_fb_debug.raw_fb_q14 = filtered_diff_q14;
+  g_fb_debug.buf_error = buf_error;
+  g_fb_debug.trim_q14 = trim_q14;
   g_fb_debug.final_fb_q14 = (uint32_t)final_fb_q14;
+  g_fb_debug.measured_hz = (filtered_diff_q14 * 1000U) >> 14;
 
   return (uint32_t)final_fb_q14;
+}
+
+void CheckRateDelta_1s(void)
+{
+  static uint32_t last_time = 0U;
+  static uint32_t last_in = 0U;
+  static uint32_t last_out = 0U;
+  static uint32_t last_dma_half = 0U;
+  static uint32_t last_dma_full = 0U;
+  static uint32_t last_sof = 0U;
+  static uint32_t last_feedback = 0U;
+  static uint32_t last_packet_bytes = 0U;
+  static uint16_t last_timer_count = 0U;
+  static uint8_t initialized = 0U;
+  const uint32_t now = HAL_GetTick();
+
+  ++g_debug_sof_callbacks;
+  if (initialized == 0U) {
+    last_time = now;
+    last_in = g_debug_samples_in;
+    last_out = g_debug_samples_out;
+    last_dma_half = g_debug_dma_half_callbacks;
+    last_dma_full = g_debug_dma_full_callbacks;
+    last_sof = g_debug_sof_callbacks;
+    last_feedback = g_debug_feedback_packets;
+    last_packet_bytes = g_debug_packet_bytes;
+    last_timer_count = (uint16_t)htim3.Instance->CNT;
+    initialized = 1U;
+    return;
+  }
+
+  if (now - last_time >= 1000U) {
+    const uint32_t elapsed_ms = now - last_time;
+    const uint16_t current_timer_count = (uint16_t)htim3.Instance->CNT;
+    g_debug_window_elapsed_ms = elapsed_ms;
+    g_debug_window_timer_edges =
+        (uint16_t)(current_timer_count - last_timer_count);
+    g_debug_window_input_samples = g_debug_samples_in - last_in;
+    g_debug_window_output_samples = g_debug_samples_out - last_out;
+    g_debug_window_output_frames = g_debug_window_output_samples / 2U;
+    g_debug_window_dma_half_callbacks =
+        g_debug_dma_half_callbacks - last_dma_half;
+    g_debug_window_dma_full_callbacks =
+        g_debug_dma_full_callbacks - last_dma_full;
+    g_debug_window_sof_callbacks = g_debug_sof_callbacks - last_sof;
+    g_debug_window_feedback_packets =
+        g_debug_feedback_packets - last_feedback;
+    g_debug_window_packet_bytes = g_debug_packet_bytes - last_packet_bytes;
+    g_dbg_delta_in = g_debug_window_input_samples;
+    g_dbg_delta_out = g_debug_window_output_samples;
+
+    last_time = now;
+    last_in = g_debug_samples_in;
+    last_out = g_debug_samples_out;
+    last_dma_half = g_debug_dma_half_callbacks;
+    last_dma_full = g_debug_dma_full_callbacks;
+    last_sof = g_debug_sof_callbacks;
+    last_feedback = g_debug_feedback_packets;
+    last_packet_bytes = g_debug_packet_bytes;
+    last_timer_count = current_timer_count;
+  }
 }
 /**
   * @}
@@ -728,7 +609,6 @@ static uint8_t USBD_AUDIO_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   haudio->iso_cont.tx_flag = 1U;
   haudio->iso_cont.ofs_packet = 0;
 
-  g_audio_fb.integral_hz = 0;
   /* USER CODE END */
 
   /* Initialize the Audio output Hardware layer */
@@ -1253,48 +1133,31 @@ static uint8_t USBD_AUDIO_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum) {
 
   if (epnum == (AUDIOOutEpAdd & 0xFU)) {
     PacketSize = (uint16_t)USBD_LL_GetRxDataSize(pdev, epnum);
+
     g_debug_packet_bytes += PacketSize;
-
-		/* USER CODE BEGIN: パケットサイズ監視用 */
-		g_fb_debug.last_pkt_size = PacketSize;
-		if (PacketSize == 192) {
-			g_fb_debug.pkt_cnt_192++;
-		} else if (PacketSize == 196) {
-			g_fb_debug.pkt_cnt_196++; // これが増えればホストが加速要求に反応している！
-		} else if (PacketSize == 188) {
-			g_fb_debug.pkt_cnt_188++;
-		}
-
-    /* USER CODE BEGIN */
-    haudio->iso_cont.ofs_packet = (haudio->iso_cont.ofs_packet + PacketSize) % AUDIO_TOTAL_BUF_SIZE;
-    /* USER CODE END */
+    g_fb_debug.last_pkt_size = PacketSize;
+    if (PacketSize == 192U) {
+      ++g_fb_debug.pkt_cnt_192;
+    } else if (PacketSize == 196U) {
+      ++g_fb_debug.pkt_cnt_196;
+    } else if (PacketSize == 188U) {
+      ++g_fb_debug.pkt_cnt_188;
+    }
 
     ((USBD_AUDIO_ItfTypeDef *)pdev->pUserData[pdev->classId])
         ->PeriodicTC(&haudio->buffer[haudio->wr_ptr], PacketSize, AUDIO_OUT_TC);
 
     haudio->wr_ptr += PacketSize;
 
-    /* USER CODE BEGIN */
-    haudio->iso_cont.usbintn++;
-
-    if ((haudio->iso_cont.usbintn % AUDIO_FB_UPDATE_INTERVAL_PACKETS) == 0U) {
-      AUDIO_UpdateFeedbackRate(haudio);
-    }
-
     if ((haudio->wr_ptr + AUDIO_OUT_PACKET) > AUDIO_TOTAL_BUF_SIZE) {
       haudio->wr_ptr = 0U;
-      haudio->iso_cont.usbintn = 0;
-      /* USER CODE END */
 
       if (haudio->offset == AUDIO_OFFSET_UNKNOWN) {
         ((USBD_AUDIO_ItfTypeDef *)pdev->pUserData[pdev->classId])
             ->AudioCmd(&haudio->buffer[0], AUDIO_TOTAL_BUF_SIZE / 2U, AUDIO_CMD_START);
         haudio->offset = AUDIO_OFFSET_NONE;
 
-        /* USER CODE BEGIN */
         haudio->iso_cont.tx_flag = 0U;
-        g_audio_fb.integral_hz = 0;
-        /* USER CODE END */
       }
     }
 

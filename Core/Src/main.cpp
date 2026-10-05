@@ -83,7 +83,6 @@ volatile uint32_t g_debug_dma_full_callbacks = 0;
 I2S_HandleTypeDef hi2s1;
 DMA_HandleTypeDef hdma_spi1_tx;
 
-TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 
 /* USER CODE BEGIN PV */
@@ -94,7 +93,6 @@ volatile uint32_t gStreamLockAcquired{0};
 volatile uint32_t gDummyChunksWithoutLock{0};
 volatile uint32_t gRequestTxRestart{0};
 volatile uint32_t gH723ReadyWasAsserted{0};
-volatile int32_t d_available{0};
 volatile uint32_t gUsbGainQ15{AudioConfig::VolumeCurve::Q15Unity};
 volatile uint32_t gUsbMute{0U};
 /* USER CODE END PV */
@@ -104,7 +102,6 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_I2S1_Init(void);
-static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 
@@ -191,7 +188,6 @@ static void resetLinkSyncState() {
   gDummyChunksWithoutLock = 0U;
   gRequestTxRestart = 1U;
   rxBuffer.reset();
-  d_available = 0;
 }
 
 static bool updateStreamLockState(bool h723ReadyNow) {
@@ -209,7 +205,6 @@ static bool updateStreamLockState(bool h723ReadyNow) {
 }
 
 static void renderDummyAudioBlock(uint32_t start, uint32_t end) {
-  d_available = 0;
   ++gDummyChunksWithoutLock;
   if (gDummyChunksWithoutLock >= AudioConfig::LinkSync::RetryChunksBeforeRestart) {
     gDummyChunksWithoutLock = 0U;
@@ -227,7 +222,6 @@ static void renderUsbAudioBlock(uint32_t start, uint32_t end) {
   const uint32_t numSamples{end - start};
   rxBuffer.read(tempBuf.data(), numSamples);
   g_debug_samples_out += numSamples;
-  d_available = static_cast<int32_t>(rxBuffer.getAvailableSamples());
 
   const uint32_t gainQ15 = (gUsbMute != 0U) ? 0U : gUsbGainQ15;
 
@@ -282,7 +276,6 @@ int main(void)
   MX_DMA_Init();
   MX_USB_DEVICE_Init();
   MX_I2S1_Init();
-  MX_TIM2_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   setF411Ready(false);
@@ -397,54 +390,6 @@ static void MX_I2S1_Init(void)
 }
 
 /**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM2_Init(void)
-{
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
-  TIM_SlaveConfigTypeDef sSlaveConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 0;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 4294967295;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sSlaveConfig.SlaveMode = TIM_SLAVEMODE_EXTERNAL1;
-  sSlaveConfig.InputTrigger = TIM_TS_TI1FP1;
-  sSlaveConfig.TriggerPolarity = TIM_TRIGGERPOLARITY_RISING;
-  sSlaveConfig.TriggerFilter = 0;
-  if (HAL_TIM_SlaveConfigSynchro(&htim2, &sSlaveConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
-
-}
-
-/**
   * @brief TIM3 Initialization Function
   * @param None
   * @retval None
@@ -554,7 +499,6 @@ void setUsbMuteState(uint8_t mute) { gUsbMute = (mute != 0U) ? 1U : 0U; }
 
 void rxBufferReset() {
   rxBuffer.reset();
-  d_available = 0;
 }
 
 int32_t rxBufferGetAvailableFrames() {
@@ -562,13 +506,11 @@ int32_t rxBufferGetAvailableFrames() {
 }
 void rxBufferWrite(int16_t *data, uint32_t length) {
   if (gStreamLockAcquired == 0U) {
-    d_available = 0;
     return;
   }
 
   rxBuffer.write(data, length);
   g_debug_samples_in += length;
-  d_available = static_cast<int32_t>(rxBuffer.getAvailableSamples());
 }
 void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s) {
   if (hi2s == &hi2s1) {
